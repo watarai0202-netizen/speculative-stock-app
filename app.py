@@ -17,7 +17,7 @@ if "auth" not in st.session_state:
 
 if not st.session_state.auth:
     st.title("🔒 認証")
-    pwd = st.text_input("パスワード", type="password")
+    pwd = st.text_input("パスワード", type="stock testa")
     if pwd == MY_PASSWORD:
         st.session_state.auth = True
         st.rerun()
