@@ -413,4 +413,263 @@ def run_backtest_top(
         )
 
         trades_out = trades.copy()
-        trades_out["ticker"] =_
+        trades_out["ticker"] = t
+        all_trades.append(trades_out)
+
+    sum_df = pd.DataFrame(summaries)
+    trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    return sum_df, trades_df
+
+
+# =========================
+# 5. メイン画面
+# =========================
+st.title(f"🚀 {target_market}・二段上げ狙い（精度UP版）")
+st.caption("第一波（複数日上昇）→枯渇（中央値RVOL）→25MA付近→ATR収縮→高値が近い、で“短期再噴火”候補を優先。")
+
+colA, colB, colC = st.columns([1.1, 1.1, 1.6])
+with colA:
+    st.write("**スキャン対象**")
+    st.write(f"- 市場: {target_market}")
+    st.write(f"- 期間: {scan_period} / 1d")
+
+with colB:
+    st.write("**主要条件**")
+    st.write(f"- 売買代金: {min_avg_value:.2f}億/日以上")
+    st.write(f"- 第一波: {jump_days}日で{min_jump:.0f}%以上")
+    st.write(f"- 枯渇: RVOL≤{vol_dry_limit:.2f}")
+
+with colC:
+    st.write("**トリガー寄せ**")
+    st.write(f"- 25MA乖離≤{ma_near_pct:.1f}% / ATR5/20≤{atr_contract_limit:.2f} / 高値距離≤{dist_to_high_limit:.1f}%")
+    st.write(f"- 25MA上向き必須: {'ON' if require_ma_up else 'OFF'}")
+
+if st.button("📡 スキャン開始", type="primary"):
+    tickers, info_db = load_master_data(target_market)
+    if not tickers:
+        st.warning("対象銘柄が見つかりませんでした。")
+        st.stop()
+
+    results: List[Dict[str, object]] = []
+    fail_reasons: Dict[str, int] = {}
+    fetch_fail: List[str] = []
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    total = len(tickers)
+    t0 = time.time()
+
+    for i in range(0, total, batch_size):
+        batch = tickers[i: i + batch_size]
+        status_text.text(f"スキャン中... {i}/{total}")
+        progress_bar.progress(min(1.0, i / total))
+
+        try:
+            df_batch = yf.download(
+                batch,
+                period=scan_period,
+                interval="1d",
+                progress=False,
+                group_by="ticker",
+                threads=True,
+                auto_adjust=use_auto_adjust,
+            )
+            if not isinstance(df_batch.columns, pd.MultiIndex):
+                df_batch = pd.concat({batch[0]: df_batch}, axis=1)
+
+            # MultiIndex: level0=ticker
+            tickers_in_batch = set(df_batch.columns.get_level_values(0))
+
+            for t in batch:
+                if t not in tickers_in_batch:
+                    fetch_fail.append(t)
+                    continue
+
+                stock_data = df_batch[t].dropna()
+                # 念のため最低列チェック
+                need_cols = {"Open", "High", "Low", "Close", "Volume"}
+                if stock_data.empty or not need_cols.issubset(set(stock_data.columns)):
+                    fetch_fail.append(t)
+                    continue
+
+                ok, reason, m = check_strategy(
+                    stock_data,
+                    min_avg_value_=min_avg_value,
+                    jump_days_=jump_days,
+                    min_jump_=min_jump,
+                    vol_dry_limit_=vol_dry_limit,
+                    ma_near_pct_=ma_near_pct,
+                    atr_contract_limit_=atr_contract_limit,
+                    dist_to_high_limit_=dist_to_high_limit,
+                    require_ma_up_=require_ma_up,
+                )
+                if not ok:
+                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                    continue
+
+                sc = score_metrics(m)
+                results.append(
+                    {
+                        "ticker": t,
+                        "コード": t.replace(".T", ""),
+                        "銘柄名": info_db.get(t, "不明"),
+                        "スコア": float(sc),
+                        "現在値": float(m["price"]),
+                        f"第一波({jump_days}日)%": float(m["max_jump"]),
+                        "枯渇RVOL(中央値)": float(m["rvol"]),
+                        "25MA乖離%": float(m["diff_ma25"]),
+                        "ATR5/20": float(m["atr_ratio"]),
+                        "高値距離%": float(m["dist_to_high"]),
+                        "代金(億円)": float(m["avg_val"]),
+                    }
+                )
+        except Exception:
+            fetch_fail.extend(batch)
+            continue
+
+    progress_bar.progress(1.0)
+    status_text.empty()
+    elapsed = time.time() - t0
+
+    # サマリー
+    st.subheader("結果サマリー")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ヒット銘柄数", f"{len(results)}")
+    c2.metric("対象銘柄数", f"{total}")
+    c3.metric("取得失敗数", f"{len(fetch_fail)}")
+    c4.metric("処理時間(秒)", f"{elapsed:.1f}")
+
+    if fail_reasons:
+        with st.expander("落選理由の内訳（チューニング用）", expanded=False):
+            reason_df = pd.DataFrame(
+                [{"理由": k, "件数": v} for k, v in sorted(fail_reasons.items(), key=lambda x: -x[1])]
+            )
+            st.dataframe(reason_df, use_container_width=True, hide_index=True)
+
+    if fetch_fail:
+        with st.expander("取得失敗ティッカー（yfinance欠損など）", expanded=False):
+            st.write(", ".join(fetch_fail[:300]) + (" ..." if len(fetch_fail) > 300 else ""))
+
+    if not results:
+        st.warning("該当銘柄なし。パラメータを緩めてみてください。")
+        st.stop()
+
+    # 表示
+    st.success(f"🎯 {len(results)} 銘柄が条件に合致しました（スコア順）")
+    res_df = pd.DataFrame(results).sort_values("スコア", ascending=False).reset_index(drop=True)
+
+    show_df = res_df.drop(columns=["ticker"]).copy()
+    show_df["スコア"] = show_df["スコア"].map(lambda x: f"{x:.3f}")
+    show_df["現在値"] = show_df["現在値"].map(lambda x: f"{x:,.1f}")
+    show_df[f"第一波({jump_days}日)%"] = show_df[f"第一波({jump_days}日)%"].map(lambda x: f"{x:.1f}%")
+    show_df["枯渇RVOL(中央値)"] = show_df["枯渇RVOL(中央値)"].map(lambda x: f"{x:.2f}倍")
+    show_df["25MA乖離%"] = show_df["25MA乖離%"].map(lambda x: f"{x:.1f}%")
+    show_df["ATR5/20"] = show_df["ATR5/20"].map(lambda x: f"{x:.2f}")
+    show_df["高値距離%"] = show_df["高値距離%"].map(lambda x: f"{x:.1f}%")
+    show_df["代金(億円)"] = show_df["代金(億円)"].map(lambda x: f"{x:.2f}億円")
+
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    # =========================
+    # 上位だけバックテスト
+    # =========================
+    if enable_backtest:
+        st.subheader("🧪 上位候補のみバックテスト（同条件シグナル→将来k日）")
+
+        top_n = min(int(top_n_bt), len(res_df))
+        top_tickers = res_df.head(top_n)["ticker"].tolist()
+
+        st.write(
+            f"- 対象：スコア上位 **{top_n}** 銘柄  / 期間：**{bt_period}**  / 先読み：**{bt_horizon}** 日  / 命中：**+{bt_hit_threshold}%** 以上"
+        )
+
+        with st.spinner("バックテスト計算中（上位だけ）..."):
+            sum_df, trades_df = run_backtest_top(
+                top_tickers,
+                period=bt_period,
+                auto_adjust=use_auto_adjust,
+                min_avg_value_=min_avg_value,
+                jump_days_=jump_days,
+                min_jump_=min_jump,
+                vol_dry_limit_=vol_dry_limit,
+                ma_near_pct_=ma_near_pct,
+                atr_contract_limit_=atr_contract_limit,
+                dist_to_high_limit_=dist_to_high_limit,
+                require_ma_up_=require_ma_up,
+                horizon=int(bt_horizon),
+                hit_threshold=float(bt_hit_threshold),
+            )
+
+        if sum_df.empty:
+            st.warning("バックテストできるデータがありませんでした（取得失敗/データ不足の可能性）。")
+        else:
+            sum_df = sum_df.copy()
+            sum_df["コード"] = sum_df["ticker"].str.replace(".T", "", regex=False)
+            sum_df["銘柄名"] = sum_df["ticker"].map(lambda x: info_db.get(x, "不明"))
+
+            hit_col = "hit_rate_%"
+            med_col = f"med_max_up_{bt_horizon}d_%"
+            sig_col = "signals"
+            sum_df = sum_df.sort_values([hit_col, med_col, sig_col], ascending=[False, False, False])
+
+            show_bt = sum_df[
+                ["コード", "銘柄名", "signals", "hit_rate_%",
+                 f"avg_max_up_{bt_horizon}d_%", f"med_max_up_{bt_horizon}d_%", f"worst_dd_{bt_horizon}d_%"]
+            ].copy()
+
+            show_bt["hit_rate_%"] = show_bt["hit_rate_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+            show_bt[f"avg_max_up_{bt_horizon}d_%"] = show_bt[f"avg_max_up_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+            show_bt[f"med_max_up_{bt_horizon}d_%"] = show_bt[f"med_max_up_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+            show_bt[f"worst_dd_{bt_horizon}d_%"] = show_bt[f"worst_dd_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+
+            st.write("**銘柄別サマリー（条件が出た日の、その後k日内の成績）**")
+            st.dataframe(show_bt, use_container_width=True, hide_index=True)
+
+            if not trades_df.empty:
+                all_hit = (trades_df["max_up_%"] >= float(bt_hit_threshold)).mean() * 100.0
+                all_med = float(np.nanmedian(trades_df["max_up_%"]))
+                all_worst = float(np.nanmin(trades_df["max_dd_%"]))
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("全シグナル数", f"{len(trades_df)}")
+                m2.metric("全体 命中率", f"{all_hit:.1f}%")
+                m3.metric("全体 中央値(MaxUp)", f"{all_med:.1f}%")
+                m4.metric("全体 ワーストDD", f"{all_worst:.1f}%")
+
+                with st.expander("全シグナル明細（必要なら）", expanded=False):
+                    td = trades_df.copy()
+                    td["コード"] = td["ticker"].str.replace(".T", "", regex=False)
+                    td["銘柄名"] = td["ticker"].map(lambda x: info_db.get(x, "不明"))
+                    td = td[["date", "コード", "銘柄名", "base_close", "max_up_%", "max_dd_%"]]
+                    td["base_close"] = td["base_close"].map(lambda x: f"{x:,.1f}")
+                    td["max_up_%"] = td["max_up_%"].map(lambda x: f"{x:.1f}%")
+                    td["max_dd_%"] = td["max_dd_%"].map(lambda x: f"{x:.1f}%")
+                    st.dataframe(td, use_container_width=True, hide_index=True)
+
+    # チャート確認導線
+    st.subheader("候補チャート（ワンクリック確認）")
+    pick_code = st.selectbox("銘柄を選択", options=res_df["コード"].tolist(), index=0)
+    pick_ticker = f"{pick_code}.T"
+
+    try:
+        df_one = yf.download(
+            pick_ticker,
+            period=scan_period,
+            interval="1d",
+            progress=False,
+            auto_adjust=use_auto_adjust,
+        ).dropna()
+
+        if len(df_one) >= 10 and "Close" in df_one.columns:
+            st.write(f"**{pick_code}：{info_db.get(pick_ticker, '不明')}**")
+            st.line_chart(df_one["Close"], height=260)
+            if "Volume" in df_one.columns:
+                st.bar_chart(df_one["Volume"], height=180)
+        else:
+            st.info("チャート表示に十分なデータがありません。")
+    except Exception as e:
+        st.warning(f"チャート取得に失敗: {e}")
+
+else:
+    st.info("左の条件を調整して「📡 スキャン開始」を押してください。")
