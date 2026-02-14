@@ -6,6 +6,7 @@ import urllib.request
 from io import BytesIO
 from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -40,31 +41,27 @@ st.sidebar.subheader("🚫 不人気フィルター")
 min_avg_value = st.sidebar.slider("最低売買代金(5日平均/億円)", 0.1, 10.0, 0.5, 0.1)
 
 st.sidebar.subheader("📈 二段上げパラメータ（精度UP版）")
-# ① 第一波（複数日）上昇：3日累積最大上昇率
 jump_days = st.sidebar.selectbox("1. 第一波の累積日数", [2, 3, 4, 5], index=1)
 min_jump = st.sidebar.slider(f"2. 過去40日の最大{jump_days}日上昇率(%)", 10, 80, 20, 1)
-
-# ② 枯渇：中央値ベースRVOL
 vol_dry_limit = st.sidebar.slider("3. 出来高枯渇度（当日/20日中央値）上限", 0.05, 1.5, 0.55, 0.05)
-
-# ③ 25MA 乖離
 ma_near_pct = st.sidebar.slider("4. 25日線との乖離(±%)", 0.5, 10.0, 2.0, 0.1)
-
-# ④ 溜め：ATR収縮
 atr_contract_limit = st.sidebar.slider("5. ATR収縮（ATR5/ATR20）上限", 0.3, 1.2, 0.75, 0.05)
-
-# ⑤ 仕掛けが近い：20日高値までの距離
 dist_to_high_limit = st.sidebar.slider("6. 20日高値までの距離(%) 上限", 0.5, 10.0, 3.0, 0.1)
-
-# ⑥ MAの向き
 require_ma_up = st.sidebar.checkbox("7. 25MAが上向き（5日前比+）を必須", value=True)
 
 st.sidebar.subheader("🧪 実行設定")
 batch_size = st.sidebar.slider("バッチサイズ（yfinance一括取得）", 10, 100, 50, 5)
 use_auto_adjust = st.sidebar.checkbox("価格を調整（auto_adjust=True）", value=True)
-scan_period = st.sidebar.selectbox("取得期間", ["3mo", "6mo", "1y"], index=1)
+scan_period = st.sidebar.selectbox("スキャン用 取得期間", ["3mo", "6mo", "1y"], index=1)
 
-# キャッシュクリア（Streamlit側のcache_data）
+st.sidebar.subheader("🧪 上位だけバックテスト")
+enable_backtest = st.sidebar.checkbox("上位候補のみバックテストする", value=True)
+top_n_bt = st.sidebar.slider("バックテスト対象（スコア上位N）", 5, 80, 20, 5)
+bt_period = st.sidebar.selectbox("バックテスト期間", ["6mo", "1y", "2y", "5y"], index=2)
+bt_horizon = st.sidebar.selectbox("将来の評価期間（k営業日）", [3, 5, 10, 15, 20], index=1)
+bt_hit_threshold = st.sidebar.slider("命中判定（k日内 最大上昇が +何% 以上）", 3, 40, 10, 1)
+
+# キャッシュクリア
 if st.sidebar.button("🔄 キャッシュクリア"):
     st.cache_data.clear()
     st.rerun()
@@ -74,7 +71,6 @@ if st.sidebar.button("🔄 キャッシュクリア"):
 # =========================
 @st.cache_data(ttl=3600)
 def load_master_data(market_name: str) -> Tuple[List[str], Dict[str, str]]:
-    """市場ごとに銘柄リストを読み込む（TSE CSV）"""
     with urllib.request.urlopen(GITHUB_CSV_URL) as resp:
         df = pd.read_csv(BytesIO(resp.read()))
 
@@ -87,10 +83,9 @@ def load_master_data(market_name: str) -> Tuple[List[str], Dict[str, str]]:
 
 
 def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
-    """ATR（単純移動平均）"""
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
     prev_close = close.shift(1)
 
     tr = pd.concat(
@@ -113,9 +108,6 @@ def check_strategy(
     dist_to_high_limit_: float,
     require_ma_up_: bool,
 ) -> Tuple[bool, str, Dict[str, float]]:
-    """
-    精度UP版「二段上げ」判定 + スコア用メトリクス返却
-    """
     need_len = max(60, 25 + 5, 20 + jump_days_)
     if len(data) < need_len:
         return False, "データ不足", {}
@@ -123,46 +115,40 @@ def check_strategy(
     c = data["Close"].astype(float)
     v = data["Volume"].astype(float)
 
-    # 0) 売買代金（直近5日平均/億円）
     avg_val = (c * v).tail(5).mean() / 1e8
     if avg_val < min_avg_value_:
         return False, "売買代金不足", {"avg_val": float(avg_val)}
 
-    # 1) 第一波：過去40日で最大「jump_days日」上昇率
-    #    例）3日上昇率 = Close / Close.shift(3) - 1
     jump_series = (c / c.shift(jump_days_) - 1.0) * 100.0
     max_jump = jump_series.tail(40).max()
     if pd.isna(max_jump) or max_jump < min_jump_:
         return False, "第一波弱い", {"max_jump": float(max_jump) if pd.notna(max_jump) else 0.0}
 
-    # 2) 出来高枯渇：当日 / 20日中央値（異常日耐性）
     v_med20 = v.tail(20).median()
     rvol_med = (v.iloc[-1] / v_med20) if v_med20 > 0 else 9.9
     if rvol_med > vol_dry_limit_:
         return False, "枯渇してない", {"rvol": float(rvol_med)}
 
-    # 3) 25MA 乖離
     ma25 = c.rolling(25).mean().iloc[-1]
     curr_p = c.iloc[-1]
     diff_ma25 = abs(curr_p - ma25) / ma25 * 100.0
     if diff_ma25 > ma_near_pct_:
         return False, "25MA乖離大", {"diff_ma25": float(diff_ma25)}
 
-    # 4) 溜め：ATR収縮（ATR5/ATR20）
     atr5 = compute_atr(data, 5).iloc[-1]
     atr20 = compute_atr(data, 20).iloc[-1]
     atr_ratio = (atr5 / atr20) if atr20 and atr20 > 0 else 9.9
     if atr_ratio > atr_contract_limit_:
         return False, "ボラ収縮弱い", {"atr_ratio": float(atr_ratio)}
 
-    # 5) 仕掛けが近い：20日高値までの距離
     high20 = c.tail(20).max()
     dist_to_high = (high20 - curr_p) / curr_p * 100.0
     if dist_to_high > dist_to_high_limit_:
         return False, "高値まで遠い", {"dist_to_high": float(dist_to_high)}
 
-    # 6) 25MAの向き
-    ma25_slope = (c.rolling(25).mean().iloc[-1]) - (c.rolling(25).mean().shift(5).iloc[-1])
+    ma25_now = c.rolling(25).mean().iloc[-1]
+    ma25_prev = c.rolling(25).mean().shift(5).iloc[-1]
+    ma25_slope = ma25_now - ma25_prev
     if require_ma_up_ and not (ma25_slope > 0):
         return False, "MA下向き", {"ma25_slope": float(ma25_slope)}
 
@@ -180,16 +166,6 @@ def check_strategy(
 
 
 def score_metrics(m: Dict[str, float]) -> float:
-    """
-    スコア（上位候補を並べるため）
-    - 第一波強いほど +（max_jump）
-    - 枯渇してるほど +（rvolが低い）
-    - ボラ収縮ほど +（atr_ratioが低い）
-    - 高値が近いほど +（dist_to_highが低い）
-    - 25MA乖離は小さいほど +
-    - MA上向きは少し加点
-    """
-    # 乱暴にクリップして安定化（極端値の影響を抑える）
     max_jump = max(0.0, min(m.get("max_jump", 0.0), 200.0))
     rvol = max(0.01, min(m.get("rvol", 9.9), 9.9))
     atr_ratio = max(0.01, min(m.get("atr_ratio", 9.9), 9.9))
@@ -197,15 +173,13 @@ def score_metrics(m: Dict[str, float]) -> float:
     diff = max(0.0, min(m.get("diff_ma25", 99.0), 99.0))
     slope = m.get("ma25_slope", 0.0)
 
-    # 0〜1っぽい指標に寄せる（簡易）
-    s_jump = max_jump / 80.0  # 80%で1付近
-    s_rvol = 1.0 / rvol       # 小さいほど高得点
+    s_jump = max_jump / 80.0
+    s_rvol = 1.0 / rvol
     s_atr = 1.0 / atr_ratio
     s_dist = 1.0 / (1.0 + dist)
     s_diff = 1.0 / (1.0 + diff)
     s_slope = 0.15 if slope > 0 else 0.0
 
-    # ウェイト（好みに合わせて調整してOK）
     return (
         1.30 * s_jump +
         1.10 * s_rvol +
@@ -217,10 +191,214 @@ def score_metrics(m: Dict[str, float]) -> float:
 
 
 # =========================
-# 4. メイン画面
+# 4. バックテスト（上位だけ）
+# =========================
+def compute_signal_series(
+    df: pd.DataFrame,
+    *,
+    min_avg_value_: float,
+    jump_days_: int,
+    min_jump_: float,
+    vol_dry_limit_: float,
+    ma_near_pct_: float,
+    atr_contract_limit_: float,
+    dist_to_high_limit_: float,
+    require_ma_up_: bool,
+) -> pd.Series:
+    """
+    各日について、同じ条件が成立しているか(True/False)を返す
+    （スキャンのcheck_strategyを「時系列化」したもの）
+    """
+    df = df.copy()
+    c = df["Close"].astype(float)
+    v = df["Volume"].astype(float)
+
+    # 売買代金（5日平均/億円）
+    avg_val = (c * v).rolling(5).mean() / 1e8
+
+    # 第一波（過去40日で最大N日上昇率がmin_jump以上）
+    jump = (c / c.shift(jump_days_) - 1.0) * 100.0
+    max_jump_40 = jump.rolling(40).max()
+
+    # RVOL（当日/20日中央値）
+    v_med20 = v.rolling(20).median()
+    rvol_med = v / v_med20
+
+    # 25MA乖離
+    ma25 = c.rolling(25).mean()
+    diff_ma25 = (c - ma25).abs() / ma25 * 100.0
+
+    # ATR収縮
+    atr5 = compute_atr(df, 5)
+    atr20 = compute_atr(df, 20)
+    atr_ratio = atr5 / atr20
+
+    # 20日高値までの距離
+    high20 = c.rolling(20).max()
+    dist_to_high = (high20 - c) / c * 100.0
+
+    # MAの向き
+    ma25_slope = ma25 - ma25.shift(5)
+
+    cond = (
+        (avg_val >= min_avg_value_) &
+        (max_jump_40 >= min_jump_) &
+        (rvol_med <= vol_dry_limit_) &
+        (diff_ma25 <= ma_near_pct_) &
+        (atr_ratio <= atr_contract_limit_) &
+        (dist_to_high <= dist_to_high_limit_)
+    )
+    if require_ma_up_:
+        cond = cond & (ma25_slope > 0)
+
+    # 最低限の必要データが揃ってから評価
+    # （NaNが残る序盤はFalseに）
+    cond = cond.fillna(False)
+
+    return cond
+
+
+def backtest_one(
+    df: pd.DataFrame,
+    signal: pd.Series,
+    horizon: int,
+) -> pd.DataFrame:
+    """
+    signal=Trueの日を起点として、将来horizon日内の最大上昇(High)と最大下落(Low)を計算
+    """
+    df = df.copy()
+    df = df.loc[signal.index]  # 念のため整列
+    c = df["Close"].astype(float).to_numpy()
+    h = df["High"].astype(float).to_numpy()
+    l = df["Low"].astype(float).to_numpy()
+    sig = signal.to_numpy()
+
+    idxs = np.where(sig)[0]
+    rows = []
+    n = len(df)
+
+    for i in idxs:
+        if i + 1 >= n:
+            continue
+        end = min(n, i + 1 + horizon)
+
+        base = c[i]
+        if not np.isfinite(base) or base <= 0:
+            continue
+
+        max_high = np.nanmax(h[i + 1:end])
+        min_low = np.nanmin(l[i + 1:end])
+
+        max_up = (max_high / base - 1.0) * 100.0 if np.isfinite(max_high) else np.nan
+        max_dd = (min_low / base - 1.0) * 100.0 if np.isfinite(min_low) else np.nan  # マイナスが大きいほど悪い
+
+        rows.append(
+            {
+                "date": df.index[i],
+                "base_close": base,
+                "max_up_%": max_up,
+                "max_dd_%": max_dd,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600)
+def run_backtest_top(
+    tickers: List[str],
+    *,
+    period: str,
+    auto_adjust: bool,
+    min_avg_value_: float,
+    jump_days_: int,
+    min_jump_: float,
+    vol_dry_limit_: float,
+    ma_near_pct_: float,
+    atr_contract_limit_: float,
+    dist_to_high_limit_: float,
+    require_ma_up_: bool,
+    horizon: int,
+    hit_threshold: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    上位tickersだけバックテストして、
+    - 銘柄別サマリー
+    - 全シグナル明細（必要なら）
+    を返す
+    """
+    summaries = []
+    all_trades = []
+
+    for t in tickers:
+        df = yf.download(
+            t,
+            period=period,
+            interval="1d",
+            progress=False,
+            auto_adjust=auto_adjust,
+        ).dropna()
+
+        # 必要列チェック
+        need_cols = {"Open", "High", "Low", "Close", "Volume"}
+        if df.empty or not need_cols.issubset(df.columns):
+            continue
+
+        sig = compute_signal_series(
+            df,
+            min_avg_value_=min_avg_value_,
+            jump_days_=jump_days_,
+            min_jump_=min_jump_,
+            vol_dry_limit_=vol_dry_limit_,
+            ma_near_pct_=ma_near_pct_,
+            atr_contract_limit_=atr_contract_limit_,
+            dist_to_high_limit_=dist_to_high_limit_,
+            require_ma_up_=require_ma_up_,
+        )
+        trades = backtest_one(df, sig, horizon=horizon)
+        if trades.empty:
+            summaries.append(
+                {
+                    "ticker": t,
+                    "signals": 0,
+                    "hit_rate_%": np.nan,
+                    f"avg_max_up_{horizon}d_%": np.nan,
+                    f"med_max_up_{horizon}d_%": np.nan,
+                    f"worst_dd_{horizon}d_%": np.nan,
+                }
+            )
+            continue
+
+        hit = (trades["max_up_%"] >= hit_threshold).mean() * 100.0
+        avg_up = float(np.nanmean(trades["max_up_%"]))
+        med_up = float(np.nanmedian(trades["max_up_%"]))
+        worst_dd = float(np.nanmin(trades["max_dd_%"]))  # 最も悪い（最小＝大きなマイナス）
+
+        summaries.append(
+            {
+                "ticker": t,
+                "signals": int(len(trades)),
+                "hit_rate_%": float(hit),
+                f"avg_max_up_{horizon}d_%": avg_up,
+                f"med_max_up_{horizon}d_%": med_up,
+                f"worst_dd_{horizon}d_%": worst_dd,
+            }
+        )
+
+        trades_out = trades.copy()
+        trades_out["ticker"] = t
+        all_trades.append(trades_out)
+
+    sum_df = pd.DataFrame(summaries)
+    trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    return sum_df, trades_df
+
+
+# =========================
+# 5. メイン画面
 # =========================
 st.title(f"🚀 {target_market}・二段上げ狙い（精度UP版）")
-st.caption("第一波（複数日上昇）→枯渇（中央値RVOL）→25MA付近→ATR収縮→高値が近い、で“明日〜数日”寄せ。")
+st.caption("第一波（複数日上昇）→枯渇（中央値RVOL）→25MA付近→ATR収縮→高値が近い、で“短期再噴火”候補を優先。")
 
 colA, colB, colC = st.columns([1.1, 1.1, 1.6])
 with colA:
@@ -239,14 +417,8 @@ with colC:
     st.write(f"- 25MA乖離≤{ma_near_pct:.1f}% / ATR5/20≤{atr_contract_limit:.2f} / 高値距離≤{dist_to_high_limit:.1f}%")
     st.write(f"- 25MA上向き必須: {'ON' if require_ma_up else 'OFF'}")
 
-# 実行
 if st.button("📡 スキャン開始", type="primary"):
-    try:
-        tickers, info_db = load_master_data(target_market)
-    except Exception as e:
-        st.error(f"マスター読み込み失敗: {e}")
-        st.stop()
-
+    tickers, info_db = load_master_data(target_market)
     if not tickers:
         st.warning("対象銘柄が見つかりませんでした。")
         st.stop()
@@ -258,12 +430,11 @@ if st.button("📡 スキャン開始", type="primary"):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # yfinanceで一括取得
     total = len(tickers)
     t0 = time.time()
 
     for i in range(0, total, batch_size):
-        batch = tickers[i : i + batch_size]
+        batch = tickers[i: i + batch_size]
         status_text.text(f"スキャン中... {i}/{total}")
         progress_bar.progress(min(1.0, i / total))
 
@@ -277,13 +448,10 @@ if st.button("📡 スキャン開始", type="primary"):
                 threads=True,
                 auto_adjust=use_auto_adjust,
             )
-
-            # 1銘柄のみの構造補正
             if not isinstance(df_batch.columns, pd.MultiIndex):
                 df_batch = pd.concat({batch[0]: df_batch}, axis=1)
 
             for t in batch:
-                # 取得漏れ
                 if t not in df_batch.columns.levels[0]:
                     fetch_fail.append(t)
                     continue
@@ -300,7 +468,6 @@ if st.button("📡 スキャン開始", type="primary"):
                     dist_to_high_limit_=dist_to_high_limit,
                     require_ma_up_=require_ma_up,
                 )
-
                 if not ok:
                     fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                     continue
@@ -308,6 +475,7 @@ if st.button("📡 スキャン開始", type="primary"):
                 sc = score_metrics(m)
                 results.append(
                     {
+                        "ticker": t,
                         "コード": t.replace(".T", ""),
                         "銘柄名": info_db.get(t, "不明"),
                         "スコア": float(sc),
@@ -320,15 +488,12 @@ if st.button("📡 スキャン開始", type="primary"):
                         "代金(億円)": float(m["avg_val"]),
                     }
                 )
-
         except Exception:
-            # バッチ単位で落ちた場合は全部取得失敗扱い
             fetch_fail.extend(batch)
             continue
 
     progress_bar.progress(1.0)
     status_text.empty()
-
     elapsed = time.time() - t0
 
     # サマリー
@@ -350,17 +515,15 @@ if st.button("📡 スキャン開始", type="primary"):
         with st.expander("取得失敗ティッカー（yfinance欠損など）", expanded=False):
             st.write(", ".join(fetch_fail[:300]) + (" ..." if len(fetch_fail) > 300 else ""))
 
-    # メイン結果
     if not results:
         st.warning("該当銘柄なし。パラメータを緩めてみてください。")
         st.stop()
 
+    # 表示
     st.success(f"🎯 {len(results)} 銘柄が条件に合致しました（スコア順）")
-
     res_df = pd.DataFrame(results).sort_values("スコア", ascending=False).reset_index(drop=True)
 
-    # 表示用フォーマット（表示は綺麗に、ソートは数値のまま）
-    show_df = res_df.copy()
+    show_df = res_df.drop(columns=["ticker"]).copy()
     show_df["スコア"] = show_df["スコア"].map(lambda x: f"{x:.3f}")
     show_df["現在値"] = show_df["現在値"].map(lambda x: f"{x:,.1f}")
     show_df[f"第一波({jump_days}日)%"] = show_df[f"第一波({jump_days}日)%"].map(lambda x: f"{x:.1f}%")
@@ -372,16 +535,92 @@ if st.button("📡 スキャン開始", type="primary"):
 
     st.dataframe(show_df, use_container_width=True, hide_index=True)
 
-    # チャート確認導線
+    # =========================
+    # 上位だけバックテスト
+    # =========================
+    if enable_backtest:
+        st.subheader("🧪 上位候補のみバックテスト（同条件シグナル→将来k日）")
+
+        top_n = min(top_n_bt, len(res_df))
+        top_tickers = res_df.head(top_n)["ticker"].tolist()
+
+        st.write(
+            f"- 対象：スコア上位 **{top_n}** 銘柄  / 期間：**{bt_period}**  / 先読み：**{bt_horizon}** 日  / 命中：**+{bt_hit_threshold}%** 以上"
+        )
+
+        with st.spinner("バックテスト計算中（上位だけ）..."):
+            sum_df, trades_df = run_backtest_top(
+                top_tickers,
+                period=bt_period,
+                auto_adjust=use_auto_adjust,
+                min_avg_value_=min_avg_value,
+                jump_days_=jump_days,
+                min_jump_=min_jump,
+                vol_dry_limit_=vol_dry_limit,
+                ma_near_pct_=ma_near_pct,
+                atr_contract_limit_=atr_contract_limit,
+                dist_to_high_limit_=dist_to_high_limit,
+                require_ma_up_=require_ma_up,
+                horizon=bt_horizon,
+                hit_threshold=float(bt_hit_threshold),
+            )
+
+        if sum_df.empty:
+            st.warning("バックテストできるデータがありませんでした（取得失敗/データ不足の可能性）。")
+        else:
+            # infoを付与
+            sum_df = sum_df.copy()
+            sum_df["コード"] = sum_df["ticker"].str.replace(".T", "", regex=False)
+            sum_df["銘柄名"] = sum_df["ticker"].map(lambda x: info_db.get(x, "不明"))
+
+            # 並び：命中率→中央値→シグナル数
+            hit_col = "hit_rate_%"
+            med_col = f"med_max_up_{bt_horizon}d_%"
+            sig_col = "signals"
+            sum_df = sum_df.sort_values([hit_col, med_col, sig_col], ascending=[False, False, False])
+
+            # 表示フォーマット
+            show_bt = sum_df[[
+                "コード", "銘柄名", "signals", "hit_rate_%",
+                f"avg_max_up_{bt_horizon}d_%", f"med_max_up_{bt_horizon}d_%", f"worst_dd_{bt_horizon}d_%"
+            ]].copy()
+
+            show_bt["hit_rate_%"] = show_bt["hit_rate_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+            show_bt[f"avg_max_up_{bt_horizon}d_%"] = show_bt[f"avg_max_up_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+            show_bt[f"med_max_up_{bt_horizon}d_%"] = show_bt[f"med_max_up_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+            show_bt[f"worst_dd_{bt_horizon}d_%"] = show_bt[f"worst_dd_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
+
+            st.write("**銘柄別サマリー（条件が出た日の、その後k日内の成績）**")
+            st.dataframe(show_bt, use_container_width=True, hide_index=True)
+
+            # 全体集計（全シグナルまとめ）
+            if not trades_df.empty:
+                all_hit = (trades_df["max_up_%"] >= bt_hit_threshold).mean() * 100.0
+                all_avg = float(np.nanmean(trades_df["max_up_%"]))
+                all_med = float(np.nanmedian(trades_df["max_up_%"]))
+                all_worst = float(np.nanmin(trades_df["max_dd_%"]))
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("全シグナル数", f"{len(trades_df)}")
+                m2.metric("全体 命中率", f"{all_hit:.1f}%")
+                m3.metric("全体 中央値(MaxUp)", f"{all_med:.1f}%")
+                m4.metric("全体 ワーストDD", f"{all_worst:.1f}%")
+
+                with st.expander("全シグナル明細（必要なら）", expanded=False):
+                    td = trades_df.copy()
+                    td["コード"] = td["ticker"].str.replace(".T", "", regex=False)
+                    td["銘柄名"] = td["ticker"].map(lambda x: info_db.get(x, "不明"))
+                    td = td[["date", "コード", "銘柄名", "base_close", "max_up_%", "max_dd_%"]]
+                    td["base_close"] = td["base_close"].map(lambda x: f"{x:,.1f}")
+                    td["max_up_%"] = td["max_up_%"].map(lambda x: f"{x:.1f}%")
+                    td["max_dd_%"] = td["max_dd_%"].map(lambda x: f"{x:.1f}%")
+                    st.dataframe(td, use_container_width=True, hide_index=True)
+
+    # チャート確認導線（スキャン結果の候補）
     st.subheader("候補チャート（ワンクリック確認）")
-    pick_code = st.selectbox(
-        "銘柄を選択",
-        options=res_df["コード"].tolist(),
-        index=0,
-    )
+    pick_code = st.selectbox("銘柄を選択", options=res_df["コード"].tolist(), index=0)
     pick_ticker = f"{pick_code}.T"
 
-    # 選択銘柄を取得して表示（軽量に直近6mo固定でもOKだが、ここはscan_periodに合わせる）
     try:
         df_one = yf.download(
             pick_ticker,
@@ -399,11 +638,6 @@ if st.button("📡 スキャン開始", type="primary"):
             st.info("チャート表示に十分なデータがありません。")
     except Exception as e:
         st.warning(f"チャート取得に失敗: {e}")
-
-    # 参考リンク（TradingView / Kabutan等は必要に応じて好みで）
-    with st.expander("外部リンク（確認用）", expanded=False):
-        st.write(f"- TradingView: https://www.tradingview.com/symbols/TSE-{pick_code}/")
-        st.write(f"- 株探: https://kabutan.jp/stock/?code={pick_code}")
 
 else:
     st.info("左の条件を調整して「📡 スキャン開始」を押してください。")
