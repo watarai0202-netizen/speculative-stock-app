@@ -245,49 +245,39 @@ def score_metrics(m: Dict[str, float]) -> float:
         s_slope
     )
     
-def score_series(df: pd.DataFrame) -> pd.Series:
-    """
-    各日について「二段上げっぽさ」をスコア化（合否ではなく連続値）
-    欠損が多い序盤はNaNになりやすいので、後段でdropnaして使う。
-    """
+def score_series(
+    df: pd.DataFrame,
+    *,
+    jump_days_: int,
+    min_avg_value_floor_: float,
+) -> pd.Series:
     c = df["Close"].astype(float)
     v = df["Volume"].astype(float)
 
-    # ① 第一波：直近 jump_days の上昇率を、過去40日maxで代表（大きいほど良い）
-    jump = (c / c.shift(jump_days) - 1.0) * 100.0
+    jump = (c / c.shift(jump_days_) - 1.0) * 100.0
     max_jump_40 = jump.rolling(40).max().clip(lower=0)
 
-    # ② 枯渇：当日/20日中央値（小さいほど良い）
     v_med20 = v.rolling(20).median()
     rvol_med = (v / v_med20).replace([np.inf, -np.inf], np.nan)
 
-    # ③ 25MA乖離：小さいほど良い
     ma25 = c.rolling(25).mean()
     diff_ma25 = ((c - ma25).abs() / ma25 * 100.0).replace([np.inf, -np.inf], np.nan)
 
-    # ④ ATR収縮：小さいほど良い
     atr5 = compute_atr(df, 5)
     atr20 = compute_atr(df, 20)
     atr_ratio = (atr5 / atr20).replace([np.inf, -np.inf], np.nan)
 
-    # ⑤ 高値距離（20日）：小さいほど良い
     high20 = c.rolling(20).max()
     dist_to_high = ((high20 - c) / c * 100.0).replace([np.inf, -np.inf], np.nan)
 
-    # ⑥ 売買代金：足切り用（小さすぎる日をスコア無効化）
     avg_val = (c * v).rolling(5).mean() / 1e8
 
-    # --- スコア化（正規化っぽく）---
-    # 大きいほど良い項：max_jump
     s_jump = (max_jump_40 / 80.0).clip(upper=3.0)
-
-    # 小さいほど良い項：rvol, atr_ratio, dist, diff
     s_rvol = (1.0 / rvol_med.clip(lower=0.05)).clip(upper=10.0)
     s_atr  = (1.0 / atr_ratio.clip(lower=0.20)).clip(upper=10.0)
     s_dist = (1.0 / (1.0 + dist_to_high.clip(lower=0.0))).clip(upper=1.0)
     s_diff = (1.0 / (1.0 + diff_ma25.clip(lower=0.0))).clip(upper=1.0)
 
-    # MA上向きボーナス（任意）
     ma25_slope = ma25 - ma25.shift(5)
     s_slope = (ma25_slope > 0).astype(float) * 0.15
 
@@ -300,10 +290,10 @@ def score_series(df: pd.DataFrame) -> pd.Series:
         s_slope
     )
 
-    # 流動性が低すぎる日は「シグナル対象外」にしたいのでNaNにする
-    score = score.where(avg_val >= min_avg_value)
-
+    # ★バックテストでは “床” を別にする（ここが重要）
+    score = score.where(avg_val >= float(min_avg_value_floor_))
     return score
+
 
 
 # =========================
