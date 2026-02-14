@@ -419,20 +419,24 @@ def run_backtest_top(
             )
             continue
 
-     # 旧: 条件ANDの完全一致シグナル
-# sig = compute_signal_series(...)
+        # =========================
+        # 新: スコア上位5%の日をシグナル扱い
+        # =========================
+        # ※ score_series() がグローバルの min_avg_value を参照しているとここで死にやすい
+        #    （理想は score_series を引数化して min_avg_value_floor_ を渡す）
+        score = score_series(df)
 
-# 新: スコア上位5%の日をシグナル扱い
-score = score_series(df)          # 各日のスコア（連続値）
-score_valid = score.dropna()      # 有効な日だけで閾値計算
+        # ★最後horizon日は「未来k日」が存在しないので、閾値計算から除外
+        score_for_thr = score.iloc[:-horizon].dropna()
 
-if score_valid.empty:
-    # データ不足などでスコアが作れない場合
-    sig = pd.Series(False, index=df.index)
-else:
-    thr = score_valid.quantile(0.95)   # 上位5% = 95パーセンタイル
-    sig = (score >= thr).fillna(False) # シグナル（True/False）
+        if score_for_thr.empty:
+            sig = pd.Series(False, index=df.index)
+        else:
+            thr = float(score_for_thr.quantile(0.95))  # 上位5%
+            sig = (score >= thr).fillna(False)
 
+            # ★最後horizon日は検証不能なのでシグナル禁止（trades=0を防ぐ）
+            sig.iloc[-horizon:] = False
 
         trades = backtest_one(df, sig, horizon=horizon)
         if trades.empty:
