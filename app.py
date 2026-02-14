@@ -301,7 +301,9 @@ def compute_signal_series(
 
 def backtest_one(df: pd.DataFrame, signal: pd.Series, horizon: int) -> pd.DataFrame:
     df = df.copy()
-    df = df.loc[signal.index]
+
+    # signal を df の index に合わせる（ここがズレると KeyError の温床）
+    signal = signal.reindex(df.index).fillna(False)
 
     c = df["Close"].astype(float).to_numpy()
     h = df["High"].astype(float).to_numpy()
@@ -327,14 +329,8 @@ def backtest_one(df: pd.DataFrame, signal: pd.Series, horizon: int) -> pd.DataFr
         max_up = (max_high / base - 1.0) * 100.0 if np.isfinite(max_high) else np.nan
         max_dd = (min_low / base - 1.0) * 100.0 if np.isfinite(min_low) else np.nan
 
-        rows.append(
-            {
-                "date": df.index[i],
-                "base_close": base,
-                "max_up_%": max_up,
-                "max_dd_%": max_dd,
-            }
-        )
+        rows.append({"date": df.index[i], "base_close": base, "max_up_%": max_up, "max_dd_%": max_dd})
+
     return pd.DataFrame(rows)
 
 
