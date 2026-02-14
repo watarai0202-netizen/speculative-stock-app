@@ -1,15 +1,14 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import os
-import time
-from io import BytesIO
 import urllib.request
+from io import BytesIO
+import time
 
 # =========================
 # 1. アプリ設定 & 認証
 # =========================
-st.set_page_config(page_title="二段上げ狙い・枯渇スキャナー", layout="wide")
+st.set_page_config(page_title="二段上げスキャナー", layout="wide")
 MY_PASSWORD = "stock testa"
 
 if "auth" not in st.session_state:
@@ -24,139 +23,145 @@ if not st.session_state.auth:
     st.stop()
 
 # =========================
-# 2. 設定（サイドバー）
+# 2. サイドバー設定（条件指定）
 # =========================
-st.sidebar.title("⚙️ スクリーニング条件")
+st.sidebar.title("⚙️ スキャン条件")
 
-GITHUB_CSV_RAW_URL = "https://raw.githubusercontent.com/watarai0202-netizen/stocktest-app-1/main/data_j.csv"
+GITHUB_CSV_URL = "https://raw.githubusercontent.com/watarai0202-netizen/stocktest-app-1/main/data_j.csv"
 
-# 不人気除外フィルター
-st.sidebar.subheader("🚫 不人気除外設定")
-min_avg_value = st.sidebar.slider("最低売買代金(直近5日平均/億円)", 0.1, 10.0, 0.5, step=0.1)
+target_market = st.sidebar.radio("📊 市場選択", ("グロース", "スタンダード", "プライム"), index=0)
 
-# 戦略フィルター
-st.sidebar.subheader("📈 二段上げ・枯渇戦略")
-lookback_days = 20 # 1ヶ月の営業日数目安
-min_jump_pct = st.sidebar.slider("1. 過去20日の最大上昇率(%)", 10, 30, 15)
-vol_dry_ratio = st.sidebar.slider("2. 出来高枯渇度(平均の何倍以下か)", 0.1, 1.0, 0.5)
-ma_diff_pct = st.sidebar.slider("3. MA(25日)からの乖離率(±%)", 0.1, 5.0, 2.0)
+st.sidebar.subheader("🚫 不人気フィルター")
+min_avg_value = st.sidebar.slider("最低売買代金(5日平均/億円)", 0.1, 5.0, 0.5)
 
-target_market = st.sidebar.radio("📊 市場", ("グロース", "スタンダード", "プライム"), index=0)
+st.sidebar.subheader("📈 戦略パラメータ")
+min_jump = st.sidebar.slider("1. 過去20日の最大上昇率(%)", 10, 30, 15)
+vol_dry_limit = st.sidebar.slider("2. 出来高枯渇度(平均の何倍か)", 0.1, 1.0, 0.5)
+ma_near_pct = st.sidebar.slider("3. 25日線との乖離(±%)", 0.5, 5.0, 2.0)
 
 # =========================
-# 3. データ処理エンジン
+# 3. ロジック関数
 # =========================
 
 @st.cache_data(ttl=3600)
-def load_master():
-    with urllib.request.urlopen(GITHUB_CSV_RAW_URL) as resp:
-        df = pd.read_csv(BytesIO(resp.read()))
-    
-    # 市場絞り込み
-    m_key = f"{target_market}（内国株式）"
-    df = df[(df["市場・商品区分"] == m_key) & (df["33業種区分"] != "－")]
-    
-    tickers = [f"{str(code).split('.')[0]}.T" for code in df["コード"]]
-    info = {f"{str(row['コード']).split('.')[0]}.T": row['銘柄名'] for _, row in df.iterrows()}
-    return tickers, info
-
-@st.cache_data(ttl=300)
-def fetch_data_batch(batch):
-    return yf.download(batch, period="3mo", interval="1d", progress=False, group_by="ticker", threads=True)
+def load_master_data(market_name):
+    """市場ごとにキャッシュを分けて銘柄リストを読み込む"""
+    try:
+        with urllib.request.urlopen(GITHUB_CSV_URL) as resp:
+            df = pd.read_csv(BytesIO(resp.read()))
+        
+        # 市場・商品区分でフィルタリング
+        m_key = f"{market_name}（内国株式）"
+        df_filtered = df[(df["市場・商品区分"] == m_key) & (df["33業種区分"] != "－")]
+        
+        tickers = [f"{str(code).split('.')[0]}.T" for code in df_filtered["コード"]]
+        info = {f"{str(row['コード']).split('.')[0]}.T": row['銘柄名'] for _, row in df_filtered.iterrows()}
+        return tickers, info
+    except Exception as e:
+        st.error(f"マスター読み込み失敗: {e}")
+        return [], {}
 
 def check_strategy(data):
     """
-    戦略ロジック:
-    1. 過去20日以内に15%以上の急騰があるか
-    2. 今日の出来高が20日平均の50%以下（枯渇）か
-    3. 25日線に近いか
+    【戦略】
+    - 過去20日以内に爆上がり(min_jump以上)がある
+    - 今日の出来高が20日平均の vol_dry_limit 以下
+    - 価格が25日移動平均線の ma_near_pct 以内
+    - 売買代金が min_avg_value 以上
     """
-    if len(data) < 25: return False, {}
+    if len(data) < 25:
+        return False, {}
+
+    c = data['Close']
+    v = data['Volume']
     
-    close = data['Close']
-    high = data['High']
-    volume = data['Volume']
-    
-    # A. 急騰履歴の確認 (直近20日の最大1日上昇率)
-    daily_ret = close.pct_change()
-    max_jump = daily_ret.tail(lookback_days).max() * 100
-    
-    # B. 出来高の枯渇 (今日の出来高 vs 20日平均)
-    avg_vol20 = volume.rolling(20).mean().iloc[-1]
-    curr_vol = volume.iloc[-1]
-    rvol = curr_vol / avg_vol20 if avg_vol20 > 0 else 99
-    
-    # C. 25日線との距離
-    ma25 = close.rolling(25).mean().iloc[-1]
-    curr_price = close.iloc[-1]
-    ma_dist = abs(curr_price - ma25) / ma25 * 100
-    
-    # D. 売買代金 (直近5日平均)
-    avg_value = (close * volume).tail(5).mean() / 1e8 # 億円
-    
-    # 判定
-    is_jumped = max_jump >= min_jump_pct
-    is_dried = rvol <= vol_dry_ratio
-    is_near_ma = ma_dist <= ma_diff_pct
-    is_liquid = avg_value >= min_avg_value
-    
-    details = {
-        "最大上昇": max_jump,
-        "出来高倍率": rvol,
-        "MA乖離": ma_dist,
-        "売買代金": avg_value
+    # 売買代金（直近5日平均/億円）
+    avg_val = (c * v).tail(5).mean() / 1e8
+    if avg_val < min_avg_value:
+        return False, {}
+
+    # 1. 過去20日の最大上昇率
+    max_jump_found = c.pct_change().tail(20).max() * 100
+    if max_jump_found < min_jump:
+        return False, {}
+
+    # 2. 出来高枯渇
+    avg_v20 = v.rolling(20).mean().iloc[-1]
+    rvol = v.iloc[-1] / avg_v20 if avg_v20 > 0 else 9.9
+    if rvol > vol_dry_limit:
+        return False, {}
+
+    # 3. MA乖離
+    ma25 = c.rolling(25).mean().iloc[-1]
+    curr_p = c.iloc[-1]
+    diff = abs(curr_p - ma25) / ma25 * 100
+    if diff > ma_near_pct:
+        return False, {}
+
+    return True, {
+        "最大上昇": max_jump_found,
+        "枯渇度": rvol,
+        "乖離率": diff,
+        "代金": avg_val
     }
-    
-    if is_jumped and is_dried and is_near_ma and is_liquid:
-        return True, details
-    return False, details
 
 # =========================
-# 4. メイン実行
+# 4. メイン画面・実行
 # =========================
-st.title(f"🔭 {target_market}・二段上げ候補スキャナー")
+st.title(f"🚀 {target_market}・二段上げ狙い")
 
 if st.button("📡 スキャン開始", type="primary"):
-    tickers, info_db = load_master()
+    tickers, info_db = load_master_data(target_market)
+    
+    if not tickers:
+        st.warning("対象銘柄が見つかりませんでした。")
+        st.stop()
+
     results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    bar = st.progress(0)
-    status = st.empty()
-    
-    batch_size = 40
+    # yfinanceで一括取得（3ヶ月分）
+    batch_size = 50
     for i in range(0, len(tickers), batch_size):
-        batch = tickers[i : i+batch_size]
-        status.text(f"分析中... {i}/{len(tickers)}")
-        bar.progress(i / len(tickers))
+        batch = tickers[i : i + batch_size]
+        status_text.text(f"スキャン中... {i}/{len(tickers)}")
+        progress_bar.progress(i / len(tickers))
         
         try:
-            df_all = fetch_data_batch(batch)
-            if not isinstance(df_all.columns, pd.MultiIndex):
-                df_all = pd.concat({batch[0]: df_all}, axis=1)
-                
+            df_batch = yf.download(batch, period="3mo", interval="1d", progress=False, group_by="ticker", threads=True)
+            
+            # 1銘柄のみの場合のデータ構造補正
+            if not isinstance(df_batch.columns, pd.MultiIndex):
+                df_batch = pd.concat({batch[0]: df_batch}, axis=1)
+
             for t in batch:
-                if t not in df_all.columns.levels[0]: continue
-                data = df_all[t].dropna()
+                if t not in df_batch.columns.levels[0]:
+                    continue
                 
-                match, d = check_strategy(data)
-                if match:
+                stock_data = df_batch[t].dropna()
+                is_match, d = check_strategy(stock_data)
+                
+                if is_match:
                     results.append({
                         "コード": t.replace(".T", ""),
                         "銘柄名": info_db.get(t, "不明"),
-                        "現在値": f"{data['Close'].iloc[-1]:,.0f}",
-                        "最大上昇率": f"{d['最大上昇']:.1f}%",
-                        "出来高倍率": f"{d['出来高倍率']:.2f}倍",
-                        "MA乖離": f"{d['MA乖離']:.1f}%",
-                        "平均代金": f"{d['売買代金']:.2f}億円",
+                        "現在値": f"{stock_data['Close'].iloc[-1]:,.1f}",
+                        "最大上昇": f"{d['最大上昇']:.1f}%",
+                        "出来高枯渇": f"{d['枯渇度']:.2f}倍",
+                        "25MA乖離": f"{d['乖離率']:.1f}%",
+                        "売買代金": f"{d['代金']:.2f}億円"
                     })
-        except:
+        except Exception:
             continue
-
-    bar.progress(1.0)
-    status.empty()
+            
+    progress_bar.progress(1.0)
+    status_text.empty()
 
     if results:
-        st.success(f"🎯 期待銘柄が {len(results)} 件見つかりました")
-        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+        st.success(f"🎯 {len(results)} 銘柄が条件に合致しました")
+        # 出来高が枯れている順（枯渇度が低い順）に表示
+        res_df = pd.DataFrame(results).sort_values("出来高枯渇")
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
     else:
-        st.warning("条件に合致する銘柄はありません。条件を少し緩めてみてください。")
+        st.warning("該当銘柄なし。パラメータを緩めてみてください。")
