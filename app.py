@@ -83,10 +83,6 @@ def load_master_data(market_name: str) -> Tuple[List[str], Dict[str, str]]:
 
 
 def fetch_ohlcv(ticker: str, period: str, auto_adjust: bool) -> pd.DataFrame:
-    """
-    yfinanceがHigh/Lowを返さない・NaNが混ざるケースでも
-    可能な限りバックテスト可能なOHLCVに整形する。
-    """
     df = yf.download(
         ticker,
         period=period,
@@ -98,16 +94,25 @@ def fetch_ohlcv(ticker: str, period: str, auto_adjust: bool) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Closeが無いと何もできない
-    if "Close" not in df.columns:
-        return pd.DataFrame()
+    # まれに MultiIndex で返るケース対策
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
 
-    # dropna() を全列対象にすると全消しになりやすいので Close だけに限定
-    df = df.dropna(subset=["Close"]).copy()
+    df = df.copy()
+
+    # Closeが無い場合、Adj CloseをCloseとして使う
+    if "Close" not in df.columns:
+        if "Adj Close" in df.columns:
+            df["Close"] = df["Adj Close"]
+        else:
+            return pd.DataFrame()
+
+    # dropna全列は危険なのでCloseだけ
+    df = df.dropna(subset=["Close"])
     if df.empty:
         return pd.DataFrame()
 
-    # 欠けがちな列は Close で補完（検証不能を避ける）
+    # 欠けやすい列を必ず作る（Closeで補完）
     for col in ["Open", "High", "Low"]:
         if col not in df.columns:
             df[col] = df["Close"]
@@ -119,14 +124,12 @@ def fetch_ohlcv(ticker: str, period: str, auto_adjust: bool) -> pd.DataFrame:
     else:
         df["Volume"] = df["Volume"].fillna(0)
 
-    # 型の安定化
+    # 型を安定化
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["Close"]).copy()
 
-    df = df.sort_index()
+    df = df.dropna(subset=["Close"]).sort_index()
     return df
-
 
 def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
     high = df["High"].astype(float)
