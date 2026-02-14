@@ -429,17 +429,20 @@ def run_backtest_top(
             )
             continue
 
-        sig = compute_signal_series(
-            df,
-            min_avg_value_=min_avg_value_,
-            jump_days_=jump_days_,
-            min_jump_=min_jump_,
-            vol_dry_limit_=vol_dry_limit_,
-            ma_near_pct_=ma_near_pct_,
-            atr_contract_limit_=atr_contract_limit_,
-            dist_to_high_limit_=dist_to_high_limit_,
-            require_ma_up_=require_ma_up_,
-        )
+     # 旧: 条件ANDの完全一致シグナル
+# sig = compute_signal_series(...)
+
+# 新: スコア上位5%の日をシグナル扱い
+score = score_series(df)          # 各日のスコア（連続値）
+score_valid = score.dropna()      # 有効な日だけで閾値計算
+
+if score_valid.empty:
+    # データ不足などでスコアが作れない場合
+    sig = pd.Series(False, index=df.index)
+else:
+    thr = score_valid.quantile(0.95)   # 上位5% = 95パーセンタイル
+    sig = (score >= thr).fillna(False) # シグナル（True/False）
+
 
         trades = backtest_one(df, sig, horizon=horizon)
         if trades.empty:
