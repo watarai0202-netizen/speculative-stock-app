@@ -382,9 +382,7 @@ def validate_recent(
     dist_to_high_limit_: float,
     require_ma_up_: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
-    """
-    直近N営業日だけ、シグナル日の将来k日 max_up / max_dd を集計する（軽量検証）
-    """
+
     per_ticker_rows = []
     trade_rows = []
 
@@ -392,27 +390,19 @@ def validate_recent(
     total_hits = 0
 
     for t in tickers:
-        # 検証は少し長めに取得（指標計算のため）
-        df = fetch_ohlcv(t, period="1y", auto_adjust=auto_adjust)
-        if df.empty or len(df) < 80:
+        # ✅ まずは十分長く取る（指標計算用）
+        df_full = fetch_ohlcv(t, period="1y", auto_adjust=auto_adjust)
+        if df_full.empty or len(df_full) < 120:
             per_ticker_rows.append(
                 {"コード": t.replace(".T", ""), "銘柄名": info_db.get(t, "不明"), "signals": 0,
                  "hit_rate_%": np.nan, "med_max_up_%": np.nan, "worst_dd_%": np.nan}
             )
             continue
 
-        # 直近N営業日だけを見る（ただし future horizon 分は必要）
-        df = df.iloc[-(recent_days + horizon + 5):].copy()
-        if len(df) < (horizon + 30):
-            per_ticker_rows.append(
-                {"コード": t.replace(".T", ""), "銘柄名": info_db.get(t, "不明"), "signals": 0,
-                 "hit_rate_%": np.nan, "med_max_up_%": np.nan, "worst_dd_%": np.nan}
-            )
-            continue
-
+        # ✅ シグナルは “全期間” で計算（rollingのため）
         if mode == "AND条件":
-            sig = signal_series_and(
-                df,
+            sig_full = signal_series_and(
+                df_full,
                 min_avg_value_=min_avg_value_,
                 jump_days_=jump_days_,
                 min_jump_=min_jump_,
@@ -423,23 +413,28 @@ def validate_recent(
                 require_ma_up_=require_ma_up_,
             )
         else:
-            sc = score_series(df, jump_days_=jump_days_, min_avg_value_=min_avg_value_)
+            sc = score_series(df_full, jump_days_=jump_days_, min_avg_value_=min_avg_value_)
             sc_valid = sc.dropna()
             if sc_valid.empty:
-                sig = pd.Series(False, index=df.index)
+                sig_full = pd.Series(False, index=df_full.index)
             else:
-                q = 1.0 - (score_top_pct_ / 100.0)
+                q = 1.0 - (score_top_pct_ / 100.0)  # 上位5%なら0.95
                 thr = sc_valid.quantile(q)
-                sig = (sc >= thr).fillna(False)
+                sig_full = (sc >= thr).fillna(False)
 
-        sig = sig.reindex(df.index).fillna(False)
+        sig_full = sig_full.reindex(df_full.index).fillna(False)
 
-        # 直近N営業日に限定（future horizon を見れる範囲）
-        # 最終 horizon 日は未来が無いので除外
-        valid_idx = df.index[:-horizon]
-        sig = sig.loc[valid_idx]
-        df2 = df.loc[valid_idx]
+        # ✅ “直近N日” の検証窓だけ切り出す（future horizon が見れる範囲）
+        if len(df_full) <= (recent_days + horizon + 5):
+            # データが短い場合は可能な範囲で
+            start = 0
+        else:
+            start = len(df_full) - (recent_days + horizon)
 
+        end = len(df_full) - horizon  # 最後のhorizon日は未来が無いので除外
+        window_idx = df_full.index[start:end]
+
+        sig = sig_full.loc[window_idx]
         if sig.sum() == 0:
             per_ticker_rows.append(
                 {"コード": t.replace(".T", ""), "銘柄名": info_db.get(t, "不明"), "signals": 0,
@@ -447,10 +442,12 @@ def validate_recent(
             )
             continue
 
-        c = df["Close"].astype(float).to_numpy()
-        h = df["High"].astype(float).to_numpy()
-        l = df["Low"].astype(float).to_numpy()
-        idx_map = {idx: i for i, idx in enumerate(df.index)}
+        # ---- 未来k日を評価 ----
+        c = df_full["Close"].astype(float).to_numpy()
+        h = df_full["High"].astype(float).to_numpy()
+        l = df_full["Low"].astype(float).to_numpy()
+
+        idx_map = {idx: i for i, idx in enumerate(df_full.index)}
         sig_dates = sig[sig].index.tolist()
 
         max_ups = []
@@ -459,17 +456,17 @@ def validate_recent(
 
         for d in sig_dates:
             i = idx_map.get(d)
-            if i is None:
+            if i is None or i + 1 >= len(df_full):
                 continue
-            if i + 1 >= len(df):
-                continue
-            end = min(len(df), i + 1 + horizon)
+
+            end_i = min(len(df_full), i + 1 + horizon)
             base = c[i]
             if not np.isfinite(base) or base <= 0:
                 continue
 
-            max_high = np.nanmax(h[i + 1:end])
-            min_low = np.nanmin(l[i + 1:end])
+            max_high = np.nanmax(h[i + 1:end_i])
+            min_low = np.nanmin(l[i + 1:end_i])
+
             max_up = (max_high / base - 1.0) * 100.0 if np.isfinite(max_high) else np.nan
             max_dd = (min_low / base - 1.0) * 100.0 if np.isfinite(min_low) else np.nan
 
@@ -494,7 +491,7 @@ def validate_recent(
             )
 
         signals = len(sig_dates)
-        hit_rate = (hits / signals * 100.0) if signals > 0 else np.nan
+        hit_rate = (hits / signals * 100.0) if signals else np.nan
 
         per_ticker_rows.append(
             {
@@ -520,6 +517,7 @@ def validate_recent(
         "overall_worst_dd_%": float(np.nanmin(trades_df["max_dd_%"])) if not trades_df.empty else np.nan,
     }
     return per_df, trades_df, overall
+
 
 
 # =========================
