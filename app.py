@@ -163,6 +163,8 @@ def check_strategy(
     *,
     min_avg_value_: float,
     jump_days_: int,
+    firstwave_lookback_: int,
+    use_high_for_firstwave_: bool,
     min_jump_: float,
     vol_dry_limit_: float,
     ma_near_pct_: float,
@@ -170,54 +172,83 @@ def check_strategy(
     dist_to_high_limit_: float,
     require_ma_up_: bool,
 ) -> Tuple[bool, str, Dict[str, float]]:
-    need_len = max(60, 25 + 5, 20 + jump_days_)
+    """
+    【戦略】
+    - 売買代金（直近5日平均） >= min_avg_value_
+    - 第一波：過去 firstwave_lookback_ 日で最大 jump_days_ 日上昇率 >= min_jump_
+      ※ use_high_for_firstwave_=True なら High で判定（ヒゲ上げ拾う）
+    - 出来高枯渇：当日 / 20日中央値 <= vol_dry_limit_
+    - 25MA乖離 <= ma_near_pct_
+    - ATR収縮：ATR5 / ATR20 <= atr_contract_limit_
+    - 20日高値までの距離 <= dist_to_high_limit_
+    - 任意：25MAが上向き（5日前比+）
+    """
+
+    # 必要な最小長（各指標のrolling/shift分を考慮）
+    need_len = max(
+        60,
+        25 + 5 + 1,              # MA25と5日前比較
+        20 + 1,                  # 20日系
+        firstwave_lookback_ + jump_days_ + 2,  # 第一波判定
+    )
     if len(data) < need_len:
+        return False, "データ不足", {}
+
+    # 必須カラム
+    required_cols = {"Open", "High", "Low", "Close", "Volume"}
+    if not required_cols.issubset(set(data.columns)):
         return False, "データ不足", {}
 
     c = data["Close"].astype(float)
     v = data["Volume"].astype(float)
 
-    # 売買代金（直近5日平均/億円）
+    # 1) 売買代金（直近5日平均/億円）
     avg_val = (c * v).tail(5).mean() / 1e8
-    if avg_val < min_avg_value_:
-        return False, "売買代金不足", {"avg_val": float(avg_val)}
+    if not np.isfinite(avg_val) or avg_val < min_avg_value_:
+        return False, "売買代金不足", {"avg_val": float(avg_val) if np.isfinite(avg_val) else 0.0}
 
-    # 第一波：過去40日で最大N日上昇率
-    jump_series = (c / c.shift(jump_days_) - 1.0) * 100.0
-    max_jump = jump_series.tail(40).max()
+    # 2) 第一波：過去lookbackの最大N日上昇率（Close or High）
+    base = data["High"].astype(float) if use_high_for_firstwave_ else c
+    jump_series = (base / base.shift(jump_days_) - 1.0) * 100.0
+    max_jump = jump_series.tail(firstwave_lookback_).max()
+
     if pd.isna(max_jump) or max_jump < min_jump_:
         return False, "第一波弱い", {"max_jump": float(max_jump) if pd.notna(max_jump) else 0.0}
 
-    # 枯渇：中央値RVOL
+    # 3) 出来高枯渇（当日/20日中央値）
     v_med20 = v.tail(20).median()
-    rvol_med = (v.iloc[-1] / v_med20) if v_med20 > 0 else 9.9
-    if rvol_med > vol_dry_limit_:
-        return False, "枯渇してない", {"rvol": float(rvol_med)}
+    rvol_med = (v.iloc[-1] / v_med20) if v_med20 > 0 else np.inf
+    if not np.isfinite(rvol_med) or rvol_med > vol_dry_limit_:
+        return False, "枯渇してない", {"rvol": float(rvol_med) if np.isfinite(rvol_med) else 9.9}
 
-    # 25MA乖離
+    # 4) 25MA乖離
     ma25 = c.rolling(25).mean().iloc[-1]
     curr_p = c.iloc[-1]
-    diff_ma25 = abs(curr_p - ma25) / ma25 * 100.0
-    if diff_ma25 > ma_near_pct_:
-        return False, "25MA乖離大", {"diff_ma25": float(diff_ma25)}
+    if not np.isfinite(ma25) or ma25 <= 0 or not np.isfinite(curr_p) or curr_p <= 0:
+        return False, "データ不足", {}
 
-    # ATR収縮
+    diff_ma25 = abs(curr_p - ma25) / ma25 * 100.0
+    if not np.isfinite(diff_ma25) or diff_ma25 > ma_near_pct_:
+        return False, "25MA乖離大", {"diff_ma25": float(diff_ma25) if np.isfinite(diff_ma25) else 99.0}
+
+    # 5) ATR収縮（ATR5/ATR20）
     atr5 = compute_atr(data, 5).iloc[-1]
     atr20 = compute_atr(data, 20).iloc[-1]
-    atr_ratio = (atr5 / atr20) if atr20 and atr20 > 0 else 9.9
-    if atr_ratio > atr_contract_limit_:
-        return False, "ボラ収縮弱い", {"atr_ratio": float(atr_ratio)}
+    atr_ratio = (atr5 / atr20) if np.isfinite(atr5) and np.isfinite(atr20) and atr20 > 0 else np.inf
+    if not np.isfinite(atr_ratio) or atr_ratio > atr_contract_limit_:
+        return False, "ボラ収縮弱い", {"atr_ratio": float(atr_ratio) if np.isfinite(atr_ratio) else 9.9}
 
-    # 高値距離（20日）
+    # 6) 高値距離（20日）
     high20 = c.tail(20).max()
-    dist_to_high = (high20 - curr_p) / curr_p * 100.0
-    if dist_to_high > dist_to_high_limit_:
-        return False, "高値まで遠い", {"dist_to_high": float(dist_to_high)}
+    dist_to_high = (high20 - curr_p) / curr_p * 100.0 if np.isfinite(high20) else np.inf
+    if not np.isfinite(dist_to_high) or dist_to_high > dist_to_high_limit_:
+        return False, "高値まで遠い", {"dist_to_high": float(dist_to_high) if np.isfinite(dist_to_high) else 99.0}
 
-    # MAの向き
+    # 7) MAの向き（任意）
     ma25_now = c.rolling(25).mean().iloc[-1]
     ma25_prev = c.rolling(25).mean().shift(5).iloc[-1]
-    ma25_slope = ma25_now - ma25_prev
+    ma25_slope = (ma25_now - ma25_prev) if np.isfinite(ma25_now) and np.isfinite(ma25_prev) else 0.0
+
     if require_ma_up_ and not (ma25_slope > 0):
         return False, "MA下向き", {"ma25_slope": float(ma25_slope)}
 
@@ -232,6 +263,7 @@ def check_strategy(
         "price": float(curr_p),
     }
     return True, "OK", metrics
+
 
 
 def score_metrics(m: Dict[str, float]) -> float:
