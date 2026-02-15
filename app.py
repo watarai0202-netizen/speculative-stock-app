@@ -42,12 +42,25 @@ min_avg_value = st.sidebar.slider("最低売買代金(5日平均/億円)", 0.1, 
 
 st.sidebar.subheader("📈 二段上げパラメータ（精度UP版）")
 jump_days = st.sidebar.selectbox("1. 第一波の累積日数", [2, 3, 4, 5], index=1)
-min_jump = st.sidebar.slider(f"2. 過去40日の最大{jump_days}日上昇率(%)", 10, 80, 20, 1)
-vol_dry_limit = st.sidebar.slider("3. 出来高枯渇度（当日/20日中央値）上限", 0.05, 1.5, 0.55, 0.05)
-ma_near_pct = st.sidebar.slider("4. 25日線との乖離(±%)", 0.5, 10.0, 2.0, 0.1)
-atr_contract_limit = st.sidebar.slider("5. ATR収縮（ATR5/ATR20）上限", 0.3, 1.2, 0.75, 0.05)
-dist_to_high_limit = st.sidebar.slider("6. 20日高値までの距離(%) 上限", 0.5, 10.0, 3.0, 0.1)
-require_ma_up = st.sidebar.checkbox("7. 25MAが上向き（5日前比+）を必須", value=True)
+
+# ★追加：第一波を探す期間（デフォ60日）
+firstwave_lookback = st.sidebar.slider("2. 第一波を探す期間（日）", 30, 120, 60, 5)
+
+# ★追加：終値ではなく高値で第一波を判定（ヒゲ上げも拾う）
+use_high_for_firstwave = st.sidebar.checkbox("第一波を高値ベースで判定（ヒゲ上げも拾う）", value=True)
+
+# ★変更：min_jumpのラベルとデフォ（20→15）
+min_jump = st.sidebar.slider(
+    f"3. 過去{firstwave_lookback}日の最大{jump_days}日上昇率(%)",
+    5, 60, 15, 1
+)
+
+vol_dry_limit = st.sidebar.slider("4. 出来高枯渇度（当日/20日中央値）上限", 0.05, 1.5, 0.55, 0.05)
+ma_near_pct = st.sidebar.slider("5. 25日線との乖離(±%)", 0.5, 10.0, 2.0, 0.1)
+atr_contract_limit = st.sidebar.slider("6. ATR収縮（ATR5/ATR20）上限", 0.3, 1.2, 0.75, 0.05)
+dist_to_high_limit = st.sidebar.slider("7. 20日高値までの距離(%) 上限", 0.5, 10.0, 3.0, 0.1)
+require_ma_up = st.sidebar.checkbox("8. 25MAが上向き（5日前比+）を必須", value=True)
+
 
 st.sidebar.subheader("🧪 実行設定")
 batch_size = st.sidebar.slider("バッチサイズ（yfinance一括取得）", 10, 100, 50, 5)
