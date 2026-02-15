@@ -406,38 +406,4 @@ if st.button("📡 スキャン開始", type="primary"):
         show_df = format_table(candidate_df.drop(columns=["ticker"]))
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
-    # =========================
-    # チャート確認導線
-    # =========================
-    st.subheader("候補チャート（ワンクリック確認）")
-    code_list = candidate_df["コード"].tolist()
-    pick_code = st.selectbox("銘柄を選択", options=code_list, index=0)
-    pick_ticker = f"{pick_code}.T"
-
-    try:
-        df_one = yf.download(
-            pick_ticker,
-            period=scan_period,
-            interval="1d",
-            progress=False,
-            auto_adjust=use_auto_adjust,
-        ).dropna()
-
-        if len(df_one) >= 30 and "Close" in df_one.columns:
-            st.write(f"**{pick_code}：{info_db.get(pick_ticker, '不明')}**")
-
-            # 25MAも一緒に見えるように
-            c = df_one["Close"].astype(float)
-            ma25 = c.rolling(25).mean()
-            plot_df = pd.DataFrame({"Close": c, "MA25": ma25}).dropna()
-            st.line_chart(plot_df, height=280)
-
-            if "Volume" in df_one.columns:
-                st.bar_chart(df_one["Volume"], height=180)
-        else:
-            st.info("チャート表示に十分なデータがありません。取得期間を6mo/1yにしてください。")
-    except Exception as e:
-        st.warning(f"チャート取得に失敗: {e}")
-
-else:
-    st.info("左の条件を調整して「📡 スキャン開始」を押してください。")
+   
