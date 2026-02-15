@@ -4,12 +4,13 @@ from __future__ import annotations
 import time
 import urllib.request
 from io import BytesIO
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+
 
 # =========================
 # 1. アプリ設定 & 認証
@@ -28,39 +29,39 @@ if not st.session_state.auth:
         st.rerun()
     st.stop()
 
+
 # =========================
-# 2. サイドバー設定（条件指定）
+# 2. サイドバー設定
 # =========================
 st.sidebar.title("⚙️ スキャン条件")
 
 GITHUB_CSV_URL = "https://raw.githubusercontent.com/watarai0202-netizen/stocktest-app-1/main/data_j.csv"
-
 target_market = st.sidebar.radio("📊 市場選択", ("グロース", "スタンダード", "プライム"), index=0)
 
-st.sidebar.subheader("🚫 不人気フィルター")
-min_avg_value = st.sidebar.slider("最低売買代金(5日平均/億円)", 0.1, 10.0, 0.5, 0.1)
+st.sidebar.subheader("🚫 不人気フィルター（最低流動性）")
+min_avg_value = st.sidebar.slider("最低売買代金(5日平均/億円)", 0.05, 10.0, 0.50, 0.05)
 
-st.sidebar.subheader("📈 二段上げパラメータ（精度UP版）")
+st.sidebar.subheader("📈 二段上げパラメータ（母数改善版）")
 jump_days = st.sidebar.selectbox("1. 第一波の累積日数", [2, 3, 4, 5], index=1)
 
-# ★追加：第一波を探す期間（デフォ60日）
+# ★追加：第一波を探す期間（母数に効く）
 firstwave_lookback = st.sidebar.slider("2. 第一波を探す期間（日）", 30, 120, 60, 5)
 
-# ★追加：終値ではなく高値で第一波を判定（ヒゲ上げも拾う）
+# ★追加：終値ではなく高値ベースで第一波（ヒゲ上げ）を拾う
 use_high_for_firstwave = st.sidebar.checkbox("第一波を高値ベースで判定（ヒゲ上げも拾う）", value=True)
 
-# ★変更：min_jumpのラベルとデフォ（20→15）
+# ★変更：min_jump を弱めたレンジ/デフォに（0件回避）
 min_jump = st.sidebar.slider(
     f"3. 過去{firstwave_lookback}日の最大{jump_days}日上昇率(%)",
     5, 60, 15, 1
 )
 
-vol_dry_limit = st.sidebar.slider("4. 出来高枯渇度（当日/20日中央値）上限", 0.05, 1.5, 0.55, 0.05)
-ma_near_pct = st.sidebar.slider("5. 25日線との乖離(±%)", 0.5, 10.0, 2.0, 0.1)
-atr_contract_limit = st.sidebar.slider("6. ATR収縮（ATR5/ATR20）上限", 0.3, 1.2, 0.75, 0.05)
-dist_to_high_limit = st.sidebar.slider("7. 20日高値までの距離(%) 上限", 0.5, 10.0, 3.0, 0.1)
-require_ma_up = st.sidebar.checkbox("8. 25MAが上向き（5日前比+）を必須", value=True)
-
+# 他条件
+vol_dry_limit = st.sidebar.slider("4. 出来高枯渇度（当日/20日中央値）上限", 0.05, 1.5, 0.60, 0.05)
+ma_near_pct = st.sidebar.slider("5. 25日線との乖離(±%)", 0.5, 10.0, 3.0, 0.1)
+atr_contract_limit = st.sidebar.slider("6. ATR収縮（ATR5/ATR20）上限", 0.3, 1.2, 0.85, 0.05)
+dist_to_high_limit = st.sidebar.slider("7. 20日高値までの距離(%) 上限", 0.5, 15.0, 6.0, 0.1)
+require_ma_up = st.sidebar.checkbox("8. 25MAが上向き（5日前比+）を必須", value=False)
 
 st.sidebar.subheader("🧪 実行設定")
 batch_size = st.sidebar.slider("バッチサイズ（yfinance一括取得）", 10, 100, 50, 5)
@@ -74,13 +75,18 @@ bt_period = st.sidebar.selectbox("バックテスト期間", ["6mo", "1y", "2y",
 bt_horizon = st.sidebar.selectbox("将来の評価期間（k営業日）", [3, 5, 10, 15, 20], index=1)
 bt_hit_threshold = st.sidebar.slider("命中判定（k日内 最大上昇が +何% 以上）", 3, 40, 10, 1)
 
+# signals=0 を避ける保険（同条件シグナルが0なら、スコア上位%で代替）
+bt_fallback_to_score = st.sidebar.checkbox("バックテストでシグナル0ならスコア上位%で代替", value=True)
+bt_fallback_top_pct = st.sidebar.slider("代替時：スコア上位(%)", 1, 20, 5, 1)
+
 # キャッシュクリア
 if st.sidebar.button("🔄 キャッシュクリア"):
     st.cache_data.clear()
     st.rerun()
 
+
 # =========================
-# 3. データ読み込み
+# 3. データ読み込み & 指標
 # =========================
 @st.cache_data(ttl=3600)
 def load_master_data(market_name: str) -> Tuple[List[str], Dict[str, str]]:
@@ -95,37 +101,27 @@ def load_master_data(market_name: str) -> Tuple[List[str], Dict[str, str]]:
     return tickers, info
 
 
-def fetch_ohlcv(ticker: str, period: str, auto_adjust: bool) -> pd.DataFrame:
-    df = yf.download(
-        ticker,
-        period=period,
-        interval="1d",
-        progress=False,
-        auto_adjust=auto_adjust,
-    )
-
+def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # まれに MultiIndex で返るケース対策
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(-1)
 
     df = df.copy()
 
-    # Closeが無い場合、Adj CloseをCloseとして使う
+    # Close
     if "Close" not in df.columns:
         if "Adj Close" in df.columns:
             df["Close"] = df["Adj Close"]
         else:
             return pd.DataFrame()
 
-    # dropna全列は危険なのでCloseだけ
-    df = df.dropna(subset=["Close"])
+    df = df.dropna(subset=["Close"]).sort_index()
     if df.empty:
         return pd.DataFrame()
 
-    # 欠けやすい列を必ず作る（Closeで補完）
+    # 欠けやすい列を補完
     for col in ["Open", "High", "Low"]:
         if col not in df.columns:
             df[col] = df["Close"]
@@ -137,12 +133,27 @@ def fetch_ohlcv(ticker: str, period: str, auto_adjust: bool) -> pd.DataFrame:
     else:
         df["Volume"] = df["Volume"].fillna(0)
 
-    # 型を安定化
+    # 型
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["Close"]).sort_index()
+    df = df.dropna(subset=["Close"])
     return df
+
+
+def fetch_ohlcv(ticker: str, period: str, auto_adjust: bool) -> pd.DataFrame:
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval="1d",
+            progress=False,
+            auto_adjust=auto_adjust,
+        )
+        return _ensure_ohlcv(df)
+    except Exception:
+        return pd.DataFrame()
+
 
 def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
     high = df["High"].astype(float)
@@ -173,82 +184,69 @@ def check_strategy(
     require_ma_up_: bool,
 ) -> Tuple[bool, str, Dict[str, float]]:
     """
-    【戦略】
-    - 売買代金（直近5日平均） >= min_avg_value_
-    - 第一波：過去 firstwave_lookback_ 日で最大 jump_days_ 日上昇率 >= min_jump_
-      ※ use_high_for_firstwave_=True なら High で判定（ヒゲ上げ拾う）
-    - 出来高枯渇：当日 / 20日中央値 <= vol_dry_limit_
-    - 25MA乖離 <= ma_near_pct_
-    - ATR収縮：ATR5 / ATR20 <= atr_contract_limit_
-    - 20日高値までの距離 <= dist_to_high_limit_
-    - 任意：25MAが上向き（5日前比+）
+    スキャン用の合否判定（AND条件）
+    「候補が0件」になりやすいので、第一波探索期間＆高値ベースで母数を確保。
     """
-
-    # 必要な最小長（各指標のrolling/shift分を考慮）
     need_len = max(
         60,
-        25 + 5 + 1,              # MA25と5日前比較
-        20 + 1,                  # 20日系
-        firstwave_lookback_ + jump_days_ + 2,  # 第一波判定
+        25 + 5 + 1,
+        20 + 1,
+        firstwave_lookback_ + jump_days_ + 2,
     )
     if len(data) < need_len:
         return False, "データ不足", {}
 
-    # 必須カラム
-    required_cols = {"Open", "High", "Low", "Close", "Volume"}
-    if not required_cols.issubset(set(data.columns)):
+    req = {"Open", "High", "Low", "Close", "Volume"}
+    if not req.issubset(set(data.columns)):
         return False, "データ不足", {}
 
     c = data["Close"].astype(float)
     v = data["Volume"].astype(float)
 
-    # 1) 売買代金（直近5日平均/億円）
+    # 売買代金（直近5日平均/億円）
     avg_val = (c * v).tail(5).mean() / 1e8
     if not np.isfinite(avg_val) or avg_val < min_avg_value_:
         return False, "売買代金不足", {"avg_val": float(avg_val) if np.isfinite(avg_val) else 0.0}
 
-    # 2) 第一波：過去lookbackの最大N日上昇率（Close or High）
+    # 第一波：過去lookbackで最大N日上昇率（Close or High）
     base = data["High"].astype(float) if use_high_for_firstwave_ else c
     jump_series = (base / base.shift(jump_days_) - 1.0) * 100.0
     max_jump = jump_series.tail(firstwave_lookback_).max()
-
     if pd.isna(max_jump) or max_jump < min_jump_:
         return False, "第一波弱い", {"max_jump": float(max_jump) if pd.notna(max_jump) else 0.0}
 
-    # 3) 出来高枯渇（当日/20日中央値）
+    # 出来高枯渇（当日/20日中央値）
     v_med20 = v.tail(20).median()
     rvol_med = (v.iloc[-1] / v_med20) if v_med20 > 0 else np.inf
     if not np.isfinite(rvol_med) or rvol_med > vol_dry_limit_:
         return False, "枯渇してない", {"rvol": float(rvol_med) if np.isfinite(rvol_med) else 9.9}
 
-    # 4) 25MA乖離
+    # 25MA乖離
     ma25 = c.rolling(25).mean().iloc[-1]
     curr_p = c.iloc[-1]
     if not np.isfinite(ma25) or ma25 <= 0 or not np.isfinite(curr_p) or curr_p <= 0:
         return False, "データ不足", {}
-
     diff_ma25 = abs(curr_p - ma25) / ma25 * 100.0
     if not np.isfinite(diff_ma25) or diff_ma25 > ma_near_pct_:
         return False, "25MA乖離大", {"diff_ma25": float(diff_ma25) if np.isfinite(diff_ma25) else 99.0}
 
-    # 5) ATR収縮（ATR5/ATR20）
+    # ATR収縮
     atr5 = compute_atr(data, 5).iloc[-1]
     atr20 = compute_atr(data, 20).iloc[-1]
     atr_ratio = (atr5 / atr20) if np.isfinite(atr5) and np.isfinite(atr20) and atr20 > 0 else np.inf
     if not np.isfinite(atr_ratio) or atr_ratio > atr_contract_limit_:
         return False, "ボラ収縮弱い", {"atr_ratio": float(atr_ratio) if np.isfinite(atr_ratio) else 9.9}
 
-    # 6) 高値距離（20日）
+    # 高値距離（20日）
     high20 = c.tail(20).max()
     dist_to_high = (high20 - curr_p) / curr_p * 100.0 if np.isfinite(high20) else np.inf
     if not np.isfinite(dist_to_high) or dist_to_high > dist_to_high_limit_:
         return False, "高値まで遠い", {"dist_to_high": float(dist_to_high) if np.isfinite(dist_to_high) else 99.0}
 
-    # 7) MAの向き（任意）
+    # MAの向き
     ma25_now = c.rolling(25).mean().iloc[-1]
     ma25_prev = c.rolling(25).mean().shift(5).iloc[-1]
     ma25_slope = (ma25_now - ma25_prev) if np.isfinite(ma25_now) and np.isfinite(ma25_prev) else 0.0
-
     if require_ma_up_ and not (ma25_slope > 0):
         return False, "MA下向き", {"ma25_slope": float(ma25_slope)}
 
@@ -265,8 +263,8 @@ def check_strategy(
     return True, "OK", metrics
 
 
-
 def score_metrics(m: Dict[str, float]) -> float:
+    """ヒット銘柄の並び替え用スコア（大きいほど良い）"""
     max_jump = max(0.0, min(m.get("max_jump", 0.0), 200.0))
     rvol = max(0.01, min(m.get("rvol", 9.9), 9.9))
     atr_ratio = max(0.01, min(m.get("atr_ratio", 9.9), 9.9))
@@ -282,44 +280,60 @@ def score_metrics(m: Dict[str, float]) -> float:
     s_slope = 0.15 if slope > 0 else 0.0
 
     return (
-        1.30 * s_jump +
+        1.25 * s_jump +
         1.10 * s_rvol +
-        1.10 * s_atr +
-        0.90 * s_dist +
-        0.70 * s_diff +
+        1.05 * s_atr +
+        0.85 * s_dist +
+        0.65 * s_diff +
         s_slope
     )
-    
+
+
 def score_series(
     df: pd.DataFrame,
     *,
     jump_days_: int,
+    firstwave_lookback_: int,
+    use_high_for_firstwave_: bool,
     min_avg_value_floor_: float,
 ) -> pd.Series:
+    """
+    バックテスト保険用：各日スコア（連続値）
+    - グローバル min_avg_value に依存しない（重要）
+    - 最低流動性は min_avg_value_floor_ で床を固定できる
+    """
     c = df["Close"].astype(float)
     v = df["Volume"].astype(float)
 
-    jump = (c / c.shift(jump_days_) - 1.0) * 100.0
-    max_jump_40 = jump.rolling(40).max().clip(lower=0)
+    # 第一波（lookback max）
+    base = df["High"].astype(float) if use_high_for_firstwave_ else c
+    jump = (base / base.shift(jump_days_) - 1.0) * 100.0
+    max_jump_lb = jump.rolling(firstwave_lookback_).max().clip(lower=0)
 
+    # 枯渇
     v_med20 = v.rolling(20).median()
     rvol_med = (v / v_med20).replace([np.inf, -np.inf], np.nan)
 
+    # 25MA乖離
     ma25 = c.rolling(25).mean()
     diff_ma25 = ((c - ma25).abs() / ma25 * 100.0).replace([np.inf, -np.inf], np.nan)
 
+    # ATR収縮
     atr5 = compute_atr(df, 5)
     atr20 = compute_atr(df, 20)
     atr_ratio = (atr5 / atr20).replace([np.inf, -np.inf], np.nan)
 
+    # 高値距離（20）
     high20 = c.rolling(20).max()
     dist_to_high = ((high20 - c) / c * 100.0).replace([np.inf, -np.inf], np.nan)
 
+    # 売買代金（床）
     avg_val = (c * v).rolling(5).mean() / 1e8
 
-    s_jump = (max_jump_40 / 80.0).clip(upper=3.0)
+    # スコア化（大きいほど良い）
+    s_jump = (max_jump_lb / 80.0).clip(upper=3.0)
     s_rvol = (1.0 / rvol_med.clip(lower=0.05)).clip(upper=10.0)
-    s_atr  = (1.0 / atr_ratio.clip(lower=0.20)).clip(upper=10.0)
+    s_atr = (1.0 / atr_ratio.clip(lower=0.20)).clip(upper=10.0)
     s_dist = (1.0 / (1.0 + dist_to_high.clip(lower=0.0))).clip(upper=1.0)
     s_diff = (1.0 / (1.0 + diff_ma25.clip(lower=0.0))).clip(upper=1.0)
 
@@ -327,28 +341,25 @@ def score_series(
     s_slope = (ma25_slope > 0).astype(float) * 0.15
 
     score = (
-        1.30 * s_jump +
+        1.25 * s_jump +
         1.10 * s_rvol +
-        1.10 * s_atr +
-        0.90 * s_dist +
-        0.70 * s_diff +
+        1.05 * s_atr +
+        0.85 * s_dist +
+        0.65 * s_diff +
         s_slope
     )
 
-    # ★バックテストでは “床” を別にする（ここが重要）
     score = score.where(avg_val >= float(min_avg_value_floor_))
     return score
 
 
-
-# =========================
-# 4. バックテスト（上位だけ）
-# =========================
 def compute_signal_series(
     df: pd.DataFrame,
     *,
     min_avg_value_: float,
     jump_days_: int,
+    firstwave_lookback_: int,
+    use_high_for_firstwave_: bool,
     min_jump_: float,
     vol_dry_limit_: float,
     ma_near_pct_: float,
@@ -356,14 +367,15 @@ def compute_signal_series(
     dist_to_high_limit_: float,
     require_ma_up_: bool,
 ) -> pd.Series:
-    df = df.copy()
+    """バックテスト用：スキャンと同じAND条件で日次シグナルを作る"""
     c = df["Close"].astype(float)
     v = df["Volume"].astype(float)
 
     avg_val = (c * v).rolling(5).mean() / 1e8
 
-    jump = (c / c.shift(jump_days_) - 1.0) * 100.0
-    max_jump_40 = jump.rolling(40).max()
+    base = df["High"].astype(float) if use_high_for_firstwave_ else c
+    jump = (base / base.shift(jump_days_) - 1.0) * 100.0
+    max_jump_lb = jump.rolling(firstwave_lookback_).max()
 
     v_med20 = v.rolling(20).median()
     rvol_med = v / v_med20
@@ -382,7 +394,7 @@ def compute_signal_series(
 
     cond = (
         (avg_val >= min_avg_value_) &
-        (max_jump_40 >= min_jump_) &
+        (max_jump_lb >= min_jump_) &
         (rvol_med <= vol_dry_limit_) &
         (diff_ma25 <= ma_near_pct_) &
         (atr_ratio <= atr_contract_limit_) &
@@ -396,8 +408,6 @@ def compute_signal_series(
 
 def backtest_one(df: pd.DataFrame, signal: pd.Series, horizon: int) -> pd.DataFrame:
     df = df.copy()
-
-    # signal を df の index に合わせる（ここがズレると KeyError の温床）
     signal = signal.reindex(df.index).fillna(False)
 
     c = df["Close"].astype(float).to_numpy()
@@ -437,6 +447,8 @@ def run_backtest_top(
     auto_adjust: bool,
     min_avg_value_: float,
     jump_days_: int,
+    firstwave_lookback_: int,
+    use_high_for_firstwave_: bool,
     min_jump_: float,
     vol_dry_limit_: float,
     ma_near_pct_: float,
@@ -445,13 +457,15 @@ def run_backtest_top(
     require_ma_up_: bool,
     horizon: int,
     hit_threshold: float,
+    fallback_to_score: bool,
+    fallback_top_pct: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     summaries = []
     all_trades = []
 
     for t in tickers:
         df = fetch_ohlcv(t, period=period, auto_adjust=auto_adjust)
-        if df.empty:
+        if df.empty or len(df) < (max(60, horizon + 30)):
             summaries.append(
                 {
                     "ticker": t,
@@ -464,24 +478,41 @@ def run_backtest_top(
             )
             continue
 
-        # =========================
-        # 新: スコア上位5%の日をシグナル扱い
-        # =========================
-        # ※ score_series() がグローバルの min_avg_value を参照しているとここで死にやすい
-        #    （理想は score_series を引数化して min_avg_value_floor_ を渡す）
-        score = score_series(df)
+        # 1) まずは「スキャン同条件」でシグナルを作る
+        sig = compute_signal_series(
+            df,
+            min_avg_value_=min_avg_value_,
+            jump_days_=jump_days_,
+            firstwave_lookback_=firstwave_lookback_,
+            use_high_for_firstwave_=use_high_for_firstwave_,
+            min_jump_=min_jump_,
+            vol_dry_limit_=vol_dry_limit_,
+            ma_near_pct_=ma_near_pct_,
+            atr_contract_limit_=atr_contract_limit_,
+            dist_to_high_limit_=dist_to_high_limit_,
+            require_ma_up_=require_ma_up_,
+        )
 
-        # ★最後horizon日は「未来k日」が存在しないので、閾値計算から除外
-        score_for_thr = score.iloc[:-horizon].dropna()
-
-        if score_for_thr.empty:
-            sig = pd.Series(False, index=df.index)
-        else:
-            thr = float(score_for_thr.quantile(0.95))  # 上位5%
-            sig = (score >= thr).fillna(False)
-
-            # ★最後horizon日は検証不能なのでシグナル禁止（trades=0を防ぐ）
+        # ★最後horizon日は未来がないのでシグナル禁止（trades=0の温床）
+        if horizon > 0 and len(sig) > horizon:
             sig.iloc[-horizon:] = False
+
+        # 2) signals=0 の時は「スコア上位%」で代替（保険）
+        if fallback_to_score and int(sig.sum()) == 0:
+            sc = score_series(
+                df,
+                jump_days_=jump_days_,
+                firstwave_lookback_=firstwave_lookback_,
+                use_high_for_firstwave_=use_high_for_firstwave_,
+                min_avg_value_floor_=0.10,  # ★バックテスト床は固定（0.10億=1000万円/日）
+            )
+            sc_thr_base = sc.iloc[:-horizon].dropna() if horizon > 0 else sc.dropna()
+            if not sc_thr_base.empty:
+                q = 1.0 - (fallback_top_pct / 100.0)
+                thr = float(sc_thr_base.quantile(q))
+                sig = (sc >= thr).fillna(False)
+                if horizon > 0 and len(sig) > horizon:
+                    sig.iloc[-horizon:] = False
 
         trades = backtest_one(df, sig, horizon=horizon)
         if trades.empty:
@@ -523,10 +554,12 @@ def run_backtest_top(
 
 
 # =========================
-# 5. メイン画面
+# 4. メイン画面
 # =========================
-st.title(f"🚀 {target_market}・二段上げ狙い（精度UP版）")
-st.caption("第一波（複数日上昇）→枯渇（中央値RVOL）→25MA付近→ATR収縮→高値が近い、で“短期再噴火”候補を優先。")
+st.title(f"🚀 {target_market}・二段上げ狙い（母数改善版）")
+st.caption(
+    "第一波（探索期間＆高値ベースで拾う）→枯渇→25MA付近→ATR収縮→高値が近い、で“短期再噴火”候補を抽出。"
+)
 
 colA, colB, colC = st.columns([1.1, 1.1, 1.6])
 with colA:
@@ -537,7 +570,7 @@ with colA:
 with colB:
     st.write("**主要条件**")
     st.write(f"- 売買代金: {min_avg_value:.2f}億/日以上")
-    st.write(f"- 第一波: {jump_days}日で{min_jump:.0f}%以上")
+    st.write(f"- 第一波: 過去{firstwave_lookback}日で{jump_days}日+{min_jump:.0f}%以上（{'高値' if use_high_for_firstwave else '終値'}）")
     st.write(f"- 枯渇: RVOL≤{vol_dry_limit:.2f}")
 
 with colC:
@@ -576,58 +609,59 @@ if st.button("📡 スキャン開始", type="primary"):
                 threads=True,
                 auto_adjust=use_auto_adjust,
             )
-            if not isinstance(df_batch.columns, pd.MultiIndex):
-                df_batch = pd.concat({batch[0]: df_batch}, axis=1)
-
-            # MultiIndex: level0=ticker
-            tickers_in_batch = set(df_batch.columns.get_level_values(0))
-
-            for t in batch:
-                if t not in tickers_in_batch:
-                    fetch_fail.append(t)
-                    continue
-
-                stock_data = df_batch[t].dropna()
-                # 念のため最低列チェック
-                need_cols = {"Open", "High", "Low", "Close", "Volume"}
-                if stock_data.empty or not need_cols.issubset(set(stock_data.columns)):
-                    fetch_fail.append(t)
-                    continue
-
-                ok, reason, m = check_strategy(
-                    stock_data,
-                    min_avg_value_=min_avg_value,
-                    jump_days_=jump_days,
-                    min_jump_=min_jump,
-                    vol_dry_limit_=vol_dry_limit,
-                    ma_near_pct_=ma_near_pct,
-                    atr_contract_limit_=atr_contract_limit,
-                    dist_to_high_limit_=dist_to_high_limit,
-                    require_ma_up_=require_ma_up,
-                )
-                if not ok:
-                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                    continue
-
-                sc = score_metrics(m)
-                results.append(
-                    {
-                        "ticker": t,
-                        "コード": t.replace(".T", ""),
-                        "銘柄名": info_db.get(t, "不明"),
-                        "スコア": float(sc),
-                        "現在値": float(m["price"]),
-                        f"第一波({jump_days}日)%": float(m["max_jump"]),
-                        "枯渇RVOL(中央値)": float(m["rvol"]),
-                        "25MA乖離%": float(m["diff_ma25"]),
-                        "ATR5/20": float(m["atr_ratio"]),
-                        "高値距離%": float(m["dist_to_high"]),
-                        "代金(億円)": float(m["avg_val"]),
-                    }
-                )
         except Exception:
             fetch_fail.extend(batch)
             continue
+
+        # 1銘柄だけの場合の補正
+        if not isinstance(df_batch.columns, pd.MultiIndex):
+            df_batch = pd.concat({batch[0]: df_batch}, axis=1)
+
+        tickers_in_batch = set(df_batch.columns.get_level_values(0))
+
+        for t in batch:
+            if t not in tickers_in_batch:
+                fetch_fail.append(t)
+                continue
+
+            stock_data = _ensure_ohlcv(df_batch[t])
+            if stock_data.empty:
+                fetch_fail.append(t)
+                continue
+
+            ok, reason, m = check_strategy(
+                stock_data,
+                min_avg_value_=min_avg_value,
+                jump_days_=jump_days,
+                firstwave_lookback_=firstwave_lookback,
+                use_high_for_firstwave_=use_high_for_firstwave,
+                min_jump_=min_jump,
+                vol_dry_limit_=vol_dry_limit,
+                ma_near_pct_=ma_near_pct,
+                atr_contract_limit_=atr_contract_limit,
+                dist_to_high_limit_=dist_to_high_limit,
+                require_ma_up_=require_ma_up,
+            )
+            if not ok:
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                continue
+
+            sc = score_metrics(m)
+            results.append(
+                {
+                    "ticker": t,
+                    "コード": t.replace(".T", ""),
+                    "銘柄名": info_db.get(t, "不明"),
+                    "スコア": float(sc),
+                    "現在値": float(m["price"]),
+                    f"第一波({jump_days}日)%": float(m["max_jump"]),
+                    "枯渇RVOL(中央値)": float(m["rvol"]),
+                    "25MA乖離%": float(m["diff_ma25"]),
+                    "ATR5/20": float(m["atr_ratio"]),
+                    "高値距離%": float(m["dist_to_high"]),
+                    "代金(億円)": float(m["avg_val"]),
+                }
+            )
 
     progress_bar.progress(1.0)
     status_text.empty()
@@ -653,7 +687,7 @@ if st.button("📡 スキャン開始", type="primary"):
             st.write(", ".join(fetch_fail[:300]) + (" ..." if len(fetch_fail) > 300 else ""))
 
     if not results:
-        st.warning("該当銘柄なし。パラメータを緩めてみてください。")
+        st.warning("該当銘柄なし。まずは「第一波%」「高値距離%」「ATR収縮」を緩めて母数を出すのがおすすめ。")
         st.stop()
 
     # 表示
@@ -676,7 +710,7 @@ if st.button("📡 スキャン開始", type="primary"):
     # 上位だけバックテスト
     # =========================
     if enable_backtest:
-        st.subheader("🧪 上位候補のみバックテスト（同条件シグナル→将来k日）")
+        st.subheader("🧪 上位候補のみバックテスト（同条件→未来k日 / 0ならスコア代替）")
 
         top_n = min(int(top_n_bt), len(res_df))
         top_tickers = res_df.head(top_n)["ticker"].tolist()
@@ -692,6 +726,8 @@ if st.button("📡 スキャン開始", type="primary"):
                 auto_adjust=use_auto_adjust,
                 min_avg_value_=min_avg_value,
                 jump_days_=jump_days,
+                firstwave_lookback_=firstwave_lookback,
+                use_high_for_firstwave_=use_high_for_firstwave,
                 min_jump_=min_jump,
                 vol_dry_limit_=vol_dry_limit,
                 ma_near_pct_=ma_near_pct,
@@ -700,6 +736,8 @@ if st.button("📡 スキャン開始", type="primary"):
                 require_ma_up_=require_ma_up,
                 horizon=int(bt_horizon),
                 hit_threshold=float(bt_hit_threshold),
+                fallback_to_score=bool(bt_fallback_to_score),
+                fallback_top_pct=int(bt_fallback_top_pct),
             )
 
         if sum_df.empty:
@@ -724,7 +762,7 @@ if st.button("📡 スキャン開始", type="primary"):
             show_bt[f"med_max_up_{bt_horizon}d_%"] = show_bt[f"med_max_up_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
             show_bt[f"worst_dd_{bt_horizon}d_%"] = show_bt[f"worst_dd_{bt_horizon}d_%"].map(lambda x: "-" if pd.isna(x) else f"{x:.1f}%")
 
-            st.write("**銘柄別サマリー（条件が出た日の、その後k日内の成績）**")
+            st.write("**銘柄別サマリー（シグナル日の、その後k日内の成績）**")
             st.dataframe(show_bt, use_container_width=True, hide_index=True)
 
             if not trades_df.empty:
@@ -748,20 +786,13 @@ if st.button("📡 スキャン開始", type="primary"):
                     td["max_dd_%"] = td["max_dd_%"].map(lambda x: f"{x:.1f}%")
                     st.dataframe(td, use_container_width=True, hide_index=True)
 
-    # チャート確認導線
+    # チャート導線
     st.subheader("候補チャート（ワンクリック確認）")
     pick_code = st.selectbox("銘柄を選択", options=res_df["コード"].tolist(), index=0)
     pick_ticker = f"{pick_code}.T"
 
     try:
-        df_one = yf.download(
-            pick_ticker,
-            period=scan_period,
-            interval="1d",
-            progress=False,
-            auto_adjust=use_auto_adjust,
-        ).dropna()
-
+        df_one = fetch_ohlcv(pick_ticker, period=scan_period, auto_adjust=use_auto_adjust)
         if len(df_one) >= 10 and "Close" in df_one.columns:
             st.write(f"**{pick_code}：{info_db.get(pick_ticker, '不明')}**")
             st.line_chart(df_one["Close"], height=260)
